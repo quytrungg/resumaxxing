@@ -32,4 +32,6 @@
 
 ## Verification
 
-<How the finished feature is proven end-to-end: commands, URLs, expected output.>
+<How the finished feature is proven end-to-end: commands, URLs, expected output.
+This section is the evidence record — do not create a separate verification
+document.>

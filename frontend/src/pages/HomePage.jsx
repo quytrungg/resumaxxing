@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { listReviews } from '../api'
 import NewReviewModal from '../components/NewReviewModal'
+import { reviewLabel } from '../reviewLabel'
 
 export default function HomePage() {
   const [reviews, setReviews] = useState([])
@@ -33,7 +34,7 @@ export default function HomePage() {
             <Link to={`/reviews/${r.id}`} className="block bg-white border rounded-lg p-4 hover:border-indigo-300 dark:bg-gray-800 dark:border-gray-700 dark:hover:border-indigo-500">
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="font-medium">Review #{r.id}</p>
+                  <p className="font-medium">{reviewLabel(r)}</p>
                   <p className="text-sm text-gray-500 dark:text-gray-400 line-clamp-1 max-w-xl">{r.jd_text}</p>
                 </div>
                 <div className="text-right">

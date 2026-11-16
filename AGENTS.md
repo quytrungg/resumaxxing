@@ -22,8 +22,10 @@ Rules and repo knowledge for any agent working in this repository.
 1. **Phase plan before implementation.** Before implementing any new feature,
    write a phase-plan markdown file in `docs/` using
    `docs/phase-plan-template.md`. A plan has: goal, success criteria (verifiable),
-   phased steps with file-level scope, and a verification section. No code until
-   the plan exists and the user has confirmed it.
+   phased steps with file-level scope, and a verification section. The plan's
+   Verification section is the evidence record — do not create separate
+   verification documents. No code until the plan exists and the user has
+   confirmed it.
 
 2. **Database changes.** Schema changes go through Alembic
    (`alembic revision --autogenerate` → `upgrade head`). Exception: one-off
@@ -44,7 +46,8 @@ Rules and repo knowledge for any agent working in this repository.
 5. **Verify before claiming done.** Backend changes: keep uvicorn running and
    exercise the endpoint with curl. Frontend changes: verify in a real browser
    (vite HMR picks changes up; no restart needed). The app must work end-to-end
-   with the `mock` provider and no API keys.
+   with the `mock` provider and no API keys. Keep the evidence in the phase
+   plan's Verification section; no separate verification doc.
 
 ## Environment facts
 
@@ -60,7 +63,9 @@ Rules and repo knowledge for any agent working in this repository.
 
 - Settings: the UI shows exactly one API-key field matching the selected
   provider; blank key fields never overwrite saved keys server-side.
-- All suggestion status changes go through the PATCH endpoint, which
-  re-scores synchronously and returns the new score.
+- All suggestion status changes go through the PATCH endpoint, which only
+  updates the status (and invalidates the polished document). Scoring is
+  explicit: `POST /api/reviews/{id}/rescore` recomputes keyword coverage + the
+  LLM score and appends one score-history entry.
 - Export: `build_final_text(base_text, suggestions)` merges ACCEPTED changes;
   keep it the single merge path for both DOCX and PDF.

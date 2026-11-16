@@ -1,7 +1,8 @@
-"""LLM service router: Claude / Ollama Cloud / Opencode Cloud, with a
+"""LLM service router: Claude / Ollama Cloud / Opencode Zen & Go, with a
 deterministic local heuristic fallback so the app runs end-to-end
 without any API keys.
 """
+import hashlib
 import json
 import re
 from typing import List, Optional
@@ -9,7 +10,10 @@ from typing import List, Optional
 import httpx
 
 from app.models import UserSettings
-from app.schemas import LLMSuggestion
+from app.schemas import LLMSuggestion, StructuredCV
+from app.services import crypto, keywords
+from app.services.document import structure_text
+from app.services.model_catalog import PROVIDERS, stored_base_url
 
 SUGGESTION_PROMPT = (
     "You are an expert tech recruiter. Compare this CV to this Job Description. "
@@ -23,38 +27,53 @@ SCORING_PROMPT = (
     'object with a single key "score" containing an integer from 0 to 100.'
 )
 
-STOPWORDS = {
-    "the", "and", "for", "with", "you", "your", "are", "our", "this", "that",
-    "will", "have", "has", "job", "role", "team", "work", "working", "ability",
-    "experience", "years", "year", "skills", "skill", "strong", "plus", "etc",
-    "including", "across", "within", "about", "from", "into", "who", "what",
-    "how", "new", "all", "any", "can", "may", "must", "requirements", "join",
-    "hiring", "senior", "junior", "looking", "candidate", "ideal", "engineer",
-    "engineering", "developer", "development", "software", "company", "teams",
-    "need", "needs", "wanted", "their", "they", "them", "who", "someone",
+REWRITE_PROMPT = (
+    "You are a professional CV editor. Rewrite the CV below into a cohesive, "
+    "professional CV tailored to the job description, incorporating the accepted "
+    "changes and removing anything that is clearly irrelevant to the role. Keep "
+    "every fact truthful: never invent employers, dates, degrees or metrics. "
+    "Return ONLY valid JSON with keys: `name` (string or null), `headline` "
+    "(string or null), `contact` (array of strings), and `sections` (array of "
+    "objects with `heading` (string) and `bullets` (array of strings)). Do not "
+    "use markdown."
+)
+
+COVER_LETTER_PROMPT = (
+    "You are a professional career writer. Write a concise cover letter (at most "
+    "350 words) for the candidate CV below against the job description. Ground it "
+    "only in facts present in the CV, reference the most relevant strengths, and "
+    "use a confident, specific tone. Return plain text only: no markdown, no JSON, "
+    "and no bracketed placeholders."
+)
+
+# Model used per provider when the caller does not override it.
+DEFAULT_MODELS = {
+    provider: spec["default_model"] for provider, spec in PROVIDERS.items()
 }
 
 
-def _keywords(text: str, top_n: int = 25) -> List[str]:
-    words = re.findall(r"[a-zA-Z][a-zA-Z+#.]{2,}", text.lower())
-    freq = {}
-    for w in words:
-        if w not in STOPWORDS:
-            freq[w] = freq.get(w, 0) + 1
-    return [w for w, _ in sorted(freq.items(), key=lambda kv: -kv[1])[:top_n]]
+def resolve_choice(settings: Optional[UserSettings],
+                   provider: Optional[str] = None,
+                   model: Optional[str] = None) -> tuple[str, Optional[str]]:
+    """Effective (provider, model): explicit override > saved setting > mock."""
+    stored_provider = settings.llm_provider if settings else None
+    prov = provider or (str(stored_provider) if stored_provider else None) or "mock"
+    if model:
+        return prov, model
+    saved = getattr(settings, PROVIDERS[prov]["model_field"], None) if (
+        settings and prov in PROVIDERS
+    ) else None
+    return prov, (str(saved) if saved else DEFAULT_MODELS.get(prov))
 
 
 def heuristic_score(cv_text: str, jd_text: str) -> int:
-    jd_kws = set(_keywords(jd_text, 30))
-    if not jd_kws:
+    if not keywords.extract_keywords(jd_text, 30):
         return 50
-    cv_lower = cv_text.lower()
-    hit = sum(1 for k in jd_kws if k in cv_lower)
-    return round(100 * hit / len(jd_kws))
+    return keywords.coverage(cv_text, jd_text, 30)["coverage"]
 
 
 def heuristic_suggestions(cv_text: str, jd_text: str) -> List[LLMSuggestion]:
-    jd_kws = _keywords(jd_text, 20)
+    jd_kws = keywords.extract_keywords(jd_text, 20)
     cv_lower = cv_text.lower()
     missing = [k for k in jd_kws if k not in cv_lower][:6]
     suggestions = [
@@ -89,19 +108,76 @@ def _extract_json(text: str) -> dict:
     return json.loads(match.group(0))
 
 
+def _candidate_name(cv_text: str) -> str:
+    for line in cv_text.splitlines():
+        line = line.strip()
+        if (line and len(line) <= 60 and "@" not in line
+                and not any(ch.isdigit() for ch in line)):
+            return line
+    return "the candidate"
+
+
+def mock_cover_letter(cv_text: str, jd_text: str,
+                      linkedin_url: Optional[str]) -> str:
+    """Template letter that slots in matched/missing JD keywords."""
+    cov = keywords.coverage(cv_text, jd_text)
+    focus_kws = cov["matched"][:4] or keywords.extract_keywords(jd_text, 4)
+    focus = ", ".join(focus_kws) if focus_kws else "software engineering"
+    name = _candidate_name(cv_text)
+
+    paragraphs = [
+        "Dear Hiring Manager,",
+        (
+            "I am writing to express my interest in the position described in "
+            f"your job posting. My background in {focus} aligns closely with "
+            "the requirements you have outlined, and I would welcome the "
+            "opportunity to contribute to your team."
+        ),
+        (
+            f"My experience centres on {focus}. The attached CV details the "
+            "projects and outcomes most relevant to this role, including how I "
+            "have applied these skills in practice."
+        ),
+    ]
+    if cov["missing"]:
+        paragraphs.append(
+            "I am also actively deepening my hands-on experience with "
+            f"{', '.join(cov['missing'][:3])}, which your posting highlights."
+        )
+    if linkedin_url:
+        paragraphs.append(
+            f"You can find further detail on my LinkedIn profile: {linkedin_url}"
+        )
+    paragraphs.append(
+        "I would be glad to discuss how my experience can support your goals. "
+        "Thank you for your time and consideration."
+    )
+    paragraphs.append(f"Sincerely,\n{name}")
+    return "\n\n".join(paragraphs) + "\n"
+
+
+def _session_id(provider: str, cv_text: str, jd_text: str) -> str:
+    """Stable per-review id; OpenCode Go routes on `x-opencode-session`."""
+    digest = hashlib.sha256(f"{provider}:{cv_text}:{jd_text}".encode()).hexdigest()
+    return f"resumaxxing-{digest[:32]}"
+
+
 async def _chat_completion(provider: str, settings: UserSettings,
-                           system: str, user: str) -> str:
+                           system: str, user: str,
+                           model: Optional[str] = None,
+                           session: Optional[str] = None) -> str:
     if provider == "claude":
+        base = stored_base_url(settings, provider)
         resp = httpx.post(
-            "https://api.anthropic.com/v1/messages",
+            f"{base}/v1/messages",
             headers={
-                "x-api-key": settings.claude_key or "",
+                "x-api-key": crypto.decrypt(settings.claude_key) or "",
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
                 "accept": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-5",
+                "model": model or DEFAULT_MODELS["claude"],
                 "max_tokens": 4096,
                 "system": system,
                 "messages": [{"role": "user", "content": user}],
@@ -114,19 +190,19 @@ async def _chat_completion(provider: str, settings: UserSettings,
             for b in resp.json().get("content", []) if b.get("type") == "text"
         )
 
-    openai_style = {
-        # Ollama Cloud exposes an OpenAI-compatible /v1 API
-        "ollama": "https://ollama.com/v1",
-        # Opencode Zen is OpenAI-compatible
-        "opencode": "https://opencode.ai/zen/v1",
-    }
-    if provider in openai_style:
-        key = settings.ollama_key if provider == "ollama" else settings.opencode_key
+    if provider in ("ollama", "opencode", "opencode_go"):
+        stored = getattr(settings, PROVIDERS[provider]["key_field"], None)
+        key = crypto.decrypt(stored)
+        base = stored_base_url(settings, provider)
+        headers = {"Authorization": f"Bearer {key}"}
+        # OpenCode Go rejects requests without a stable session id.
+        if provider == "opencode_go" and session:
+            headers["x-opencode-session"] = session
         resp = httpx.post(
-            f"{openai_style[provider]}/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
+            f"{base}/v1/chat/completions",
+            headers=headers,
             json={
-                "model": "gpt-oss:120b-cloud" if provider == "ollama" else "grok-code",
+                "model": model or DEFAULT_MODELS[provider],
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
@@ -141,26 +217,75 @@ async def _chat_completion(provider: str, settings: UserSettings,
 
 
 async def llm_review(cv_text: str, jd_text: str,
-                     settings: Optional[UserSettings]) -> tuple[int, List[LLMSuggestion]]:
-    provider = settings.llm_provider if settings else "mock"
+                     settings: Optional[UserSettings],
+                     provider: Optional[str] = None,
+                     model: Optional[str] = None) -> tuple[int, List[LLMSuggestion]]:
+    provider, model = resolve_choice(settings, provider, model)
     if provider == "mock":
         return heuristic_score(cv_text, jd_text), heuristic_suggestions(cv_text, jd_text)
 
     body = f"CV:\n{cv_text}\n\nJOB DESCRIPTION:\n{jd_text}"
-    raw = await _chat_completion(provider, settings, SUGGESTION_PROMPT, body)
+    raw = await _chat_completion(provider, settings, SUGGESTION_PROMPT, body,
+                                 model=model,
+                                 session=_session_id(provider, cv_text, jd_text))
     parsed = _extract_json(raw)
     items = parsed if isinstance(parsed, list) else parsed.get("suggestions", [])
     suggestions = [LLMSuggestion(**s) for s in items]
-    score = await llm_score(cv_text, jd_text, settings)
+    score = await llm_score(cv_text, jd_text, settings, provider=provider, model=model)
     return score, suggestions
 
 
 async def llm_score(cv_text: str, jd_text: str,
-                    settings: Optional[UserSettings]) -> int:
-    provider = settings.llm_provider if settings else "mock"
+                    settings: Optional[UserSettings],
+                    provider: Optional[str] = None,
+                    model: Optional[str] = None) -> int:
+    provider, model = resolve_choice(settings, provider, model)
     if provider == "mock":
         return heuristic_score(cv_text, jd_text)
 
     body = f"CV:\n{cv_text}\n\nJOB DESCRIPTION:\n{jd_text}"
-    raw = await _chat_completion(provider, settings, SCORING_PROMPT, body)
+    raw = await _chat_completion(provider, settings, SCORING_PROMPT, body,
+                                 model=model,
+                                 session=_session_id(provider, cv_text, jd_text))
     return int(_extract_json(raw)["score"])
+
+
+async def rewrite_cv(cv_text: str, accepted_changes: List[str], jd_text: str,
+                     settings: Optional[UserSettings],
+                     provider: Optional[str] = None,
+                     model: Optional[str] = None) -> StructuredCV:
+    """Rewrite the CV into a structured document. Raises on provider failure so
+    the caller can fall back to `document.structure_text`."""
+    provider, model = resolve_choice(settings, provider, model)
+    if provider == "mock":
+        return structure_text(cv_text)
+
+    changes = "\n".join(f"- {c}" for c in accepted_changes) or "(none)"
+    body = (
+        f"CURRENT CV:\n{cv_text}\n\n"
+        f"ACCEPTED CHANGES TO INCORPORATE:\n{changes}\n\n"
+        f"JOB DESCRIPTION:\n{jd_text}"
+    )
+    raw = await _chat_completion(provider, settings, REWRITE_PROMPT, body,
+                                 model=model,
+                                 session=_session_id(provider, cv_text, jd_text))
+    return StructuredCV.model_validate(_extract_json(raw))
+
+
+async def generate_cover_letter(cv_text: str, jd_text: str,
+                                linkedin_url: Optional[str],
+                                settings: Optional[UserSettings],
+                                provider: Optional[str] = None,
+                                model: Optional[str] = None) -> str:
+    provider, model = resolve_choice(settings, provider, model)
+    if provider == "mock":
+        return mock_cover_letter(cv_text, jd_text, linkedin_url)
+
+    body = (
+        f"CV:\n{cv_text}\n\nJOB DESCRIPTION:\n{jd_text}\n\n"
+        f"LINKEDIN PROFILE: {linkedin_url or '(none provided)'}"
+    )
+    raw = await _chat_completion(provider, settings, COVER_LETTER_PROMPT, body,
+                                 model=model,
+                                 session=_session_id(provider, cv_text, jd_text))
+    return raw.strip()

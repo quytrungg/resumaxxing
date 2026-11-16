@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
-    Column, Integer, String, Text, DateTime, ForeignKey, Enum as SAEnum
+    Column, Integer, String, Text, DateTime, ForeignKey, Enum as SAEnum, JSON
 )
 from sqlalchemy.orm import relationship
 
@@ -42,10 +42,21 @@ class UserSettings(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
-    llm_provider = Column(String(50), default="mock")  # claude | ollama | opencode | mock
+    llm_provider = Column(String(50), default="mock")  # claude | ollama | opencode | opencode_go | mock
     claude_key = Column(Text, nullable=True)
     ollama_key = Column(Text, nullable=True)
     opencode_key = Column(Text, nullable=True)
+    opencode_go_key = Column(Text, nullable=True)
+    # Optional per-provider endpoint overrides (local Ollama, proxies).
+    claude_base_url = Column(String(500), nullable=True)
+    ollama_base_url = Column(String(500), nullable=True)
+    opencode_base_url = Column(String(500), nullable=True)
+    opencode_go_base_url = Column(String(500), nullable=True)
+    # Default model per provider when a review does not pin one.
+    claude_model = Column(String(100), nullable=True)
+    ollama_model = Column(String(100), nullable=True)
+    opencode_model = Column(String(100), nullable=True)
+    opencode_go_model = Column(String(100), nullable=True)
     linkedin_url = Column(String(500), nullable=True)
 
     user = relationship("User", back_populates="settings")
@@ -70,6 +81,9 @@ class JobDescription(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     source_url = Column(String(1000), nullable=True)
     raw_text = Column(Text, nullable=False)
+    # Resolved headline from the posting; null when nothing credible was found.
+    title = Column(String(255), nullable=True)
+    company = Column(String(255), nullable=True)
 
 
 class CVReview(Base):
@@ -82,11 +96,33 @@ class CVReview(Base):
     current_score = Column(Integer, default=0)
     status = Column(SAEnum(ReviewStatus), default=ReviewStatus.draft)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # LLM pinned for this review (null on pre-existing rows -> saved setting).
+    llm_provider = Column(String(50), nullable=True)
+    llm_model = Column(String(100), nullable=True)
+    # Structured CV produced by the LLM rewrite at finalize time.
+    final_document = Column(JSON, nullable=True)
+    cover_letter = Column(Text, nullable=True)
 
     suggestions = relationship("Suggestion", back_populates="review",
                                cascade="all, delete-orphan")
+    score_events = relationship("ScoreEvent", back_populates="review",
+                                cascade="all, delete-orphan",
+                                order_by="ScoreEvent.id")
     base_cv = relationship("BaseCV")
     job_description = relationship("JobDescription")
+
+
+class ScoreEvent(Base):
+    __tablename__ = "score_events"
+
+    id = Column(Integer, primary_key=True)
+    cv_review_id = Column(Integer, ForeignKey("cv_reviews.id"), nullable=False,
+                          index=True)
+    score = Column(Integer, nullable=False)
+    reason = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    review = relationship("CVReview", back_populates="score_events")
 
 
 class Suggestion(Base):

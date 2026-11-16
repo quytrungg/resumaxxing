@@ -24,7 +24,16 @@ export default function SuggestionCard({ suggestion, onDecide, disabled }) {
             <span className="text-xs font-medium text-gray-500 dark:text-gray-400">— {suggestion.status}</span>
           )}
         </div>
-        {!decided && (
+        {decided ? (
+          <button
+            onClick={() => onDecide(suggestion.id, 'PENDING')}
+            disabled={disabled}
+            className="px-3 py-1 text-xs font-medium bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
+            title="Return this suggestion to pending"
+          >
+            Undo
+          </button>
+        ) : (
           <div className="flex gap-2">
             <button
               onClick={() => onDecide(suggestion.id, 'ACCEPTED')}

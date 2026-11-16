@@ -1,6 +1,18 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { createReview, uploadCv } from '../api'
+import { createReview, getSettings, listProviderModels, uploadCv } from '../api'
+import ModelSelect from './ModelSelect'
+import {
+  PROVIDERS as LLM_PROVIDERS,
+  PROVIDER_MAP,
+  loadCatalog,
+  rememberModels,
+} from '../llmProviders'
+
+const PROVIDERS = [
+  { value: 'mock', label: 'Mock (local heuristic)' },
+  ...LLM_PROVIDERS.map((p) => ({ value: p.value, label: p.label })),
+]
 
 export default function NewReviewModal({ onClose }) {
   const navigate = useNavigate()
@@ -8,8 +20,57 @@ export default function NewReviewModal({ onClose }) {
   const [mode, setMode] = useState('text')
   const [jdText, setJdText] = useState('')
   const [jdUrl, setJdUrl] = useState('')
+  const [provider, setProvider] = useState('')
+  const [model, setModel] = useState('')
+  const [savedProvider, setSavedProvider] = useState('mock')
+  const [savedSettings, setSavedSettings] = useState(null)
+  const [models, setModels] = useState([])
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const [modelError, setModelError] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
+
+  useEffect(() => {
+    getSettings()
+      .then((s) => {
+        setSavedProvider(s.llm_provider ?? 'mock')
+        setSavedSettings(s)
+      })
+      .catch(() => {})
+  }, [])
+
+  const effectiveProvider = provider || savedProvider
+  const usesModelName = effectiveProvider !== 'mock'
+  const effectiveSpec = PROVIDER_MAP[effectiveProvider]
+  const providerDefault = (effectiveSpec
+    && (savedSettings?.[effectiveSpec.modelField] || effectiveSpec.defaultModel)) || null
+
+  useEffect(() => {
+    if (!usesModelName) {
+      setModels([])
+      setModelError(null)
+      setModelsLoading(false)
+      return undefined
+    }
+    const cached = loadCatalog()[effectiveProvider]
+    setModels(cached || [])
+    setModelError(null)
+    setModelsLoading(true)
+    let cancelled = false
+    listProviderModels({ provider: effectiveProvider })
+      .then((r) => {
+        if (cancelled) return
+        setModels(r.models)
+        rememberModels(loadCatalog(), effectiveProvider, r.models)
+      })
+      .catch((e2) => {
+        if (!cancelled) setModelError(e2.message)
+      })
+      .finally(() => {
+        if (!cancelled) setModelsLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [effectiveProvider, usesModelName])
 
   async function handleSubmit(e) {
     e.preventDefault()
@@ -17,9 +78,10 @@ export default function NewReviewModal({ onClose }) {
     setError(null)
     try {
       if (cvFile) await uploadCv(cvFile)
-      const review = await createReview(
-        mode === 'url' ? { jd_url: jdUrl } : { jd_text: jdText },
-      )
+      const payload = mode === 'url' ? { jd_url: jdUrl } : { jd_text: jdText }
+      payload.llm_provider = effectiveProvider
+      if (usesModelName && model.trim()) payload.llm_model = model.trim()
+      const review = await createReview(payload)
       navigate(`/reviews/${review.id}`)
     } catch (e2) {
       setError(e2.message)
@@ -90,6 +152,57 @@ export default function NewReviewModal({ onClose }) {
                 onChange={(e) => setJdUrl(e.target.value)}
               />
             )}
+          </section>
+
+          <section className="border dark:border-gray-700 rounded-lg p-4">
+            <h2 className="font-semibold mb-2">3. Review model</h2>
+            <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">
+              Choose which LLM reviews this CV. The choice is pinned to this review —
+              later rescoring, finalize and the cover letter use it too.
+            </p>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-sm font-medium mb-1">Provider</label>
+                <select
+                  value={effectiveProvider}
+                  onChange={(e) => { setProvider(e.target.value); setModel('') }}
+                  className="w-full border rounded-md p-2 text-sm dark:bg-gray-900 dark:border-gray-600"
+                >
+                  {PROVIDERS.map((p) => {
+                    const providerSpec = PROVIDER_MAP[p.value]
+                    const mask = providerSpec ? savedSettings?.[providerSpec.keyField] : ''
+                    const configured = p.value === 'mock'
+                      || Boolean(mask)
+                      || savedProvider === p.value
+                    return (
+                      <option key={p.value} value={p.value} disabled={!configured}>
+                        {mask
+                          ? `${p.label} · ${mask}`
+                          : `${p.label}${configured ? '' : ' — no key saved'}`}
+                      </option>
+                    )
+                  })}
+                </select>
+              </div>
+              {usesModelName && (
+                <div>
+                  <label className="block text-sm font-medium mb-1">Model (optional)</label>
+                  <ModelSelect
+                    value={model}
+                    onChange={setModel}
+                    options={models}
+                    providerLabel={effectiveSpec?.label || effectiveProvider}
+                    defaultOption={providerDefault}
+                    placeholder={providerDefault || 'Provider default'}
+                    loading={modelsLoading}
+                    error={modelError}
+                  />
+                  <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
+                    Fetched from the selected provider. Leave empty for its default.
+                  </p>
+                </div>
+              )}
+            </div>
           </section>
 
           {error && <p className="text-red-600 text-sm">{error}</p>}
