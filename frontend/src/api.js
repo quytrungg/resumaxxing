@@ -88,6 +88,68 @@ export async function getReview(id) {
   return (await request(`/reviews/${id}`)).json()
 }
 
+/**
+ * Tail a running review over SSE (fetch + reader, so X-App-Password works).
+ * Calls `onEvent` per frame and settles on done/error. Falls back to polling
+ * via `onError` when streaming is unavailable.
+ */
+export async function streamReviewEvents(id, { onEvent, signal, onError } = {}) {
+  let res
+  try {
+    res = await request(`/reviews/${id}/events`, {
+      signal,
+      headers: { Accept: 'text/event-stream' },
+    })
+  } catch (e) {
+    if (!signal?.aborted) onError?.(e)
+    return
+  }
+  if (!res.body) {
+    onError?.(new Error('Streaming is not supported by this browser'))
+    return
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let boundary = buffer.indexOf('\n\n')
+      while (boundary !== -1) {
+        const frame = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        const payload = frame
+          .split('\n')
+          .filter((line) => line.startsWith('data:'))
+          .map((line) => line.slice(5).trimStart())
+          .join('\n')
+        if (payload) {
+          let event
+          try {
+            event = JSON.parse(payload)
+          } catch {
+            event = null // ignore malformed frame
+          }
+          if (event) {
+            onEvent?.(event)
+            if (event.type === 'done' || event.type === 'error') {
+              reader.cancel().catch(() => {})
+              return event
+            }
+          }
+        }
+        boundary = buffer.indexOf('\n\n')
+      }
+    }
+  } catch (e) {
+    if (!signal?.aborted) onError?.(e)
+  }
+}
+
 export async function setSuggestionStatus(reviewId, suggestionId, status) {
   return (await request(`/reviews/${reviewId}/suggestions/${suggestionId}`, {
     method: 'PATCH',
@@ -96,15 +158,34 @@ export async function setSuggestionStatus(reviewId, suggestionId, status) {
   })).json()
 }
 
+export async function updateSuggestionText(reviewId, suggestionId, text) {
+  return (await request(`/reviews/${reviewId}/suggestions/${suggestionId}/text`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ suggested_text: text }),
+  })).json()
+}
+
+export async function resetSuggestionText(reviewId, suggestionId) {
+  return (await request(`/reviews/${reviewId}/suggestions/${suggestionId}/text`, {
+    method: 'DELETE',
+  })).json()
+}
+
 export async function rescoreReview(id) {
   return (await request(`/reviews/${id}/rescore`, { method: 'POST' })).json()
 }
 
-export async function finalizeReview(id, format, mode = 'polished') {
-  const res = await request(
-    `/reviews/${id}/finalize?format=${format}&mode=${mode}`,
-    { method: 'POST' },
-  )
+export async function refreshRequirements(id) {
+  return (await request(`/reviews/${id}/requirements/refresh`, {
+    method: 'POST',
+  })).json()
+}
+
+export async function finalizeReview(id, format) {
+  const res = await request(`/reviews/${id}/finalize?format=${format}`, {
+    method: 'POST',
+  })
   download(await res.blob(), `cv_optimized_${id}.${format}`)
 }
 

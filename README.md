@@ -22,9 +22,9 @@ as DOCX or PDF.
   reviewed with.
 - **JD from text or URL** — paste the description or point the backend at a
   posting URL to scrape (SSRF-guarded).
-- **Polished export** — on finalize an LLM rewrites the CV into a structured
-  document rendered as a styled DOCX or layout-correct PDF; a merge-only "quick
-  merge" export stays available.
+- **Tailored download** — on download the CV is rewritten into a structured
+  document rendered as a styled DOCX, a layout-correct PDF, or a standalone
+  LaTeX source file written to top-tier engineering CV standards.
 - **Cover letter** — generate a tailored letter from the finalized CV, edit it
   inline, save it, and download as DOCX or PDF.
 

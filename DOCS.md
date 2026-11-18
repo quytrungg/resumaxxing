@@ -51,11 +51,15 @@ undecryptable (they can be re-entered on the Settings page). Generate one with
 | DELETE | `/api/settings/providers/{provider}` | Clear that provider's key, base URL and default model (active provider falls back to `mock`). |
 | POST | `/api/cv/upload` | multipart `file` (pdf/docx/txt) → parse + store |
 | GET | `/api/cv/latest` | most recent CV |
-| POST | `/api/reviews` | `{jd_text}` or `{jd_url}`, optional `llm_provider` (`mock\|claude\|ollama\|opencode\|opencode_go`) + `llm_model` → scrape, resolve the JD title/company, LLM review, score + suggestions. The choice is pinned on the review. |
-| GET | `/api/reviews` / `/api/reviews/{id}` | list / detail (suggestions, keyword coverage, score history, final document, cover letter, `jd_title`/`jd_company`) |
+| POST | `/api/reviews` | `{jd_text}` or `{jd_url}`, optional `llm_provider` (`mock\|claude\|ollama\|opencode\|opencode_go`) + `llm_model` → **202** with `run_state: "running"`; the JD is scraped first (bad URLs still 400), then the LLM review runs in the background. The choice is pinned on the review. |
+| GET | `/api/reviews` / `/api/reviews/{id}` | list / detail (suggestions, ATS requirements + coverage, score history, final document, cover letter, `jd_title`/`jd_company`, `run_state`/`run_error`) |
+| GET | `/api/reviews/{id}/events` | SSE stream for a running review: `stage`, `delta` (`kind: thinking\|output`), then one `done` or `error` frame. Replays buffered events on connect; a finished review yields one terminal frame. |
 | PATCH | `/api/reviews/{id}/suggestions/{sid}` | `{status: ACCEPTED\|REJECTED\|PENDING}` → status only; no LLM call, score/coverage unchanged. `PENDING` is Undo. |
-| POST | `/api/reviews/{id}/rescore` | re-score from current accepted/rejected/pending choices (one LLM call) → score, keyword coverage, new history entry |
-| POST | `/api/reviews/{id}/finalize?format=docx\|pdf&mode=polished\|quick` | polished: LLM rewrite + structured render (stored, reused on repeat); quick: merge-only |
+| PUT | `/api/reviews/{id}/suggestions/{sid}/text` | `{suggested_text}` → save the user's own wording for an ADD/UPDATE suggestion. The first AI text is kept in `original_suggested_text`; status is untouched, no LLM call, stored downloads are cleared. REMOVE and blank text are 400/422. |
+| DELETE | `/api/reviews/{id}/suggestions/{sid}/text` | restore the AI wording saved in `original_suggested_text` and clear it; 400 when there is nothing to restore. |
+| POST | `/api/reviews/{id}/rescore` | re-score from current accepted/rejected/pending choices (one LLM call) → score, ATS requirements + coverage, new history entry |
+| POST | `/api/reviews/{id}/requirements/refresh` | re-extract the JD requirement list (one LLM call) and return the review; 502 when the provider fails |
+| POST | `/api/reviews/{id}/finalize?format=docx\|pdf\|tex` | rewrite the CV (stored, reused on repeat): `docx`/`pdf` render the structured document in the LaTeX template's layout, `tex` returns a LaTeX source file. Any suggestion decision or text edit clears the stored outputs. |
 | POST | `/api/reviews/{id}/cover-letter` | generate from the finalized CV + JD (409 until finalized) |
 | PUT | `/api/reviews/{id}/cover-letter` | save edits `{text}` |
 | POST | `/api/reviews/{id}/cover-letter/export?format=docx\|pdf` | download the saved letter |
@@ -64,16 +68,47 @@ undecryptable (they can be re-entered on the Settings page). Generate one with
 
 Interactive docs at `http://localhost:8001/docs` while the backend runs.
 
+### Async review runs
+
+Creating a review no longer blocks on the model. `POST /api/reviews` persists the
+row (`run_state="running"`), schedules `_run_review` on the running event loop
+and returns immediately, so the modal navigates straight to
+`/reviews/{id}`. That page subscribes to `GET /api/reviews/{id}/events` and
+renders a thinking panel: four stages (job description → CV scan → drafting
+suggestions → scoring), each with the model's own streamed text nested under
+the active one. Reasoning-capable models surface
+`reasoning_content`/`thinking` deltas; once the JSON payload starts, the panel
+shows a "composing" state instead of dumping raw JSON. On `done` the page
+re-fetches the review and swaps to the normal view with no reload.
+
+The run finishes with one of:
+
+- `complete` — suggestions and score committed together with the `initial
+  review` score event;
+- `failed` — `run_error` holds a readable message, no partial suggestions and
+  `current_score` stays 0.
+
+Run state is persisted (`cv_reviews.run_state`, `run_error`); the transcript is
+not. The event buffer lives in `services/progress.py`, in this process only, so
+the backend must run as a single uvicorn worker. A review left `running` after a
+restart is reconciled to `failed` ("Interrupted…") the next time its detail page
+or stream is requested, so it never spins forever.
+
+All provider I/O is async (`httpx.AsyncClient`), so a language-model call never
+blocks other requests; JD scraping runs in a worker thread.
+
 ## Database schema
 
-Alembic-managed (`backend/alembic/`; revisions `78c3f4a7ed00` → `319d33f05a24`):
+Alembic-managed (`backend/alembic/`; revisions `78c3f4a7ed00` → `9e44b4ed5fa0`):
 `users`, `user_settings` (provider + encrypted keys + base URLs + default models
 + LinkedIn URL),
 `base_cvs` (file path + parsed text),
 `job_descriptions` (URL + raw text + resolved `title`/`company`),
 `cv_reviews` (score, draft/finalized, pinned `llm_provider`/`llm_model`,
-`final_document` JSON, `cover_letter`),
-`suggestions` (ADD/REMOVE/UPDATE × PENDING/ACCEPTED/REJECTED),
+`final_document` JSON, `final_latex` source, `cover_letter`, background-run
+`run_state`/`run_error`),
+`suggestions` (ADD/REMOVE/UPDATE × PENDING/ACCEPTED/REJECTED; `original_suggested_text`
+holds the first AI wording once the user edits `suggested_text`),
 `score_events` (score history: one row per review creation and per decision).
 
 Migrations: edit `backend/app/models.py`, then
@@ -104,16 +139,50 @@ Settings page lists models from `{base}/v1/models` with the typed or saved key
 (`services/model_catalog.py`) and caches the result in `localStorage`; the New
 Review modal reuses that catalog for its model picker.
 
-Prompts enforce structured JSON: suggestions (`type`, `target_section`,
+Review prompts ask for a short prose analysis *before* the JSON so the thinking
+panel has something human-readable to stream; `_extract_json` tolerates leading
+prose. The payloads stay structured: suggestions (`type`, `target_section`,
 `original_text`, `suggested_text`, `reasoning`), a scoring call returning
 `{"score": 0-100}`, and a finalize rewrite returning
-`{name, headline, contact[], sections[{heading, bullets[]}]}`. Cover letters are
-plain text. If a rewrite call fails the backend falls back to the deterministic
-structurer in `services/document.py`, so finalize never breaks.
+`{name, headline, contact[], sections[{heading, bullets[]}]}`. The structured
+rewrite applies the same top-tier content standards as the LaTeX rewrite
+(summary first, reverse-chronological action-verb bullets, grouped skills, no
+invented facts) so Word, PDF and LaTeX read alike. Cover letters are
+plain text. The `.tex` download asks the model to rewrite the CV to top-tier
+software-engineer standards and to keep the pinned preamble; the backend keeps
+only the document body from that response, re-applies the known-good preamble
+from `services/latex.py` (so the layout never depends on the model), rejects
+unbalanced or unsafe source (file-reading/shell primitives) and falls back to
+the deterministic template otherwise. `services/export.py` owns the single
+layout spec (`CV_LAYOUT`) that the Word and PDF renderers share with that
+template. If the structured rewrite call fails the backend falls back to the
+deterministic structurer in `services/document.py`, so finalize never breaks.
 
-`services/keywords.py` owns JD keyword extraction and ATS coverage
-(`{matched, missing, coverage}`). It is heuristic-only, so coverage is identical
-for every provider and needs no key; the `mock` score is exactly that coverage.
+### ATS requirements and coverage
+
+`services/requirements.py` owns the ATS signal, split into two halves:
+
+- **Extraction** (`llm.extract_requirements`) runs once per review with the
+  pinned provider and stores `{label, canonical, aliases, importance, category,
+  quote}` on `job_descriptions.jd_requirements`. `importance` is `must` or
+  `nice`; `quote` is the JD line that asked for it, shown as evidence in the
+  panel. Alias lists let a category ("front-end frameworks") be satisfied by a
+  concrete tool ("React").
+- **Matching** is deterministic and provider-independent: word-boundary regexes
+  plus the surface forms in `services/skills_aliases.py`. `java` never matches
+  inside `javascript`, and CJK-free skills like `C++`/`C#`/`.net` are matched
+  exactly. Ambiguous terms (`Go`, `React`, `Flask`) are matched case-sensitively
+  so prose does not count as a skill.
+
+`GET /api/reviews/{id}` returns `requirements[]` with per-item `matched`, a
+weighted `keyword_coverage` (must-have is worth three nice-to-haves) and the
+`must_have_coverage` / `nice_to_have_coverage` split. Rows created before the
+column existed fall back to `requirements.from_heuristic()` at read time, so no
+backfill is needed.
+
+`services/keywords.py` still owns the word-frequency extractor: it backs the
+`mock`/offline fallback list, the `mock` score and the template cover letter.
+The `mock` score is exactly that old coverage number.
 
 ## Security
 
@@ -137,6 +206,21 @@ for every provider and needs no key; the `mock` score is exactly that coverage.
 
 - No multi-user accounts or sessions — a single default user is auto-provisioned.
 - No automated tests yet; verification is manual (curl + browser).
-- Keyword matching is literal (no stemming/synonyms), so ATS coverage is a
-  heuristic signal.
+- Review runs are single-process only: the progress broker is in-memory, so the
+  app must be served by one uvicorn worker. The thinking transcript is not
+  persisted and a run interrupted by a restart loses its partial results (the
+  row is marked `failed` on the next read).
+- Requirement extraction needs a real provider: with `mock` (or when the call
+  fails) the list degrades to the word-frequency fallback, which still contains
+  single-word noise.
+- Matching is literal plus the curated alias table — no stemming, embeddings or
+  semantic category inference. A synonym missing from `skills_aliases.py` reads
+  as a miss.
+- The heuristic ADD suggestions for `mock` still come from the old keyword list,
+  so they can propose filler such as `- Deep`; real providers do not.
 - Reviews cannot be renamed, archived or deleted yet.
+- LaTeX downloads are served as source only — nothing is compiled server-side,
+  so a local TeX toolchain (`pdflatex`) is needed to produce a PDF from the
+  `.tex` file. The `pdf` and `docx` downloads re-implement that template's
+  layout natively (`services/export.py`), using Times as the closest available
+  stand-in for Latin Modern.

@@ -84,6 +84,9 @@ class JobDescription(Base):
     # Resolved headline from the posting; null when nothing credible was found.
     title = Column(String(255), nullable=True)
     company = Column(String(255), nullable=True)
+    # LLM-extracted requirement set for this posting (services/requirements.py).
+    # Null means "not extracted yet" - readers fall back to the heuristic list.
+    jd_requirements = Column(JSON, nullable=True)
 
 
 class CVReview(Base):
@@ -101,7 +104,14 @@ class CVReview(Base):
     llm_model = Column(String(100), nullable=True)
     # Structured CV produced by the LLM rewrite at finalize time.
     final_document = Column(JSON, nullable=True)
+    # LaTeX source produced for the .tex download (same rewrite, .tex layout).
+    final_latex = Column(Text, nullable=True)
     cover_letter = Column(Text, nullable=True)
+    # Background run state: running | complete | failed. Separate from `status`
+    # (draft/finalized) so no Postgres enum surgery is needed.
+    run_state = Column(String(20), nullable=False, server_default="complete",
+                       default="complete")
+    run_error = Column(Text, nullable=True)
 
     suggestions = relationship("Suggestion", back_populates="review",
                                cascade="all, delete-orphan")
@@ -134,6 +144,11 @@ class Suggestion(Base):
     target_section = Column(String(100), nullable=True)
     original_text = Column(Text, nullable=True)
     suggested_text = Column(Text, nullable=False)
+    # First AI wording, captured only when the user first edits
+    # `suggested_text`; null means the text is still the LLM's own. Lets the
+    # card offer "Reset to AI text" (see routers/reviews.py suggestion text
+    # endpoints).
+    original_suggested_text = Column(Text, nullable=True)
     reasoning = Column(Text, nullable=True)
     status = Column(SAEnum(SuggestionStatus), default=SuggestionStatus.PENDING)
 

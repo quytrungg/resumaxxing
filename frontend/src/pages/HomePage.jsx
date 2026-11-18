@@ -38,10 +38,21 @@ export default function HomePage() {
                   <p className="text-sm text-gray-500 dark:text-gray-400 line-clamp-1 max-w-xl">{r.jd_text}</p>
                 </div>
                 <div className="text-right">
-                  <p className={`text-xl font-bold ${r.current_score >= 70 ? 'text-green-600' : r.current_score >= 40 ? 'text-yellow-600' : 'text-red-600'}`}>
-                    {r.current_score}%
+                  {r.run_state === 'running' ? (
+                    <p className="flex items-center justify-end gap-1.5 text-sm font-semibold text-indigo-600 dark:text-indigo-400">
+                      <span className="h-2 w-2 animate-pulse rounded-full bg-indigo-500" />
+                      Analyzing…
+                    </p>
+                  ) : (
+                    <p className={`text-xl font-bold ${r.current_score >= 70 ? 'text-green-600' : r.current_score >= 40 ? 'text-yellow-600' : 'text-red-600'}`}>
+                      {r.current_score}%
+                    </p>
+                  )}
+                  <p className="text-xs text-gray-400">
+                    {r.run_state === 'running'
+                      ? 'running'
+                      : r.run_state === 'failed' ? 'failed' : r.status}
                   </p>
-                  <p className="text-xs text-gray-400">{r.status}</p>
                 </div>
               </div>
             </Link>

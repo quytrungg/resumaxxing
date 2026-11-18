@@ -63,9 +63,23 @@ Rules and repo knowledge for any agent working in this repository.
 
 - Settings: the UI shows exactly one API-key field matching the selected
   provider; blank key fields never overwrite saved keys server-side.
+- Review creation is asynchronous: `POST /api/reviews` returns 202 and the LLM
+  work runs in a background task streamed over SSE. Never move provider calls
+  back into the request handler, and keep provider I/O async (`AsyncClient`) so
+  one review cannot freeze the API.
 - All suggestion status changes go through the PATCH endpoint, which only
-  updates the status (and invalidates the polished document). Scoring is
+  updates the status (and invalidates the stored download outputs:
+  `final_document` + `final_latex`). Scoring is
   explicit: `POST /api/reviews/{id}/rescore` recomputes keyword coverage + the
   LLM score and appends one score-history entry.
+- Suggestion *text* edits go through `PUT /api/reviews/{id}/suggestions/{sid}/text`
+  (ADD/UPDATE only; REMOVE has no replacement text). The first AI wording is
+  copied into `original_suggested_text` so `DELETE …/text` can restore it; the
+  edit never changes status, never calls the LLM, and still clears the stored
+  downloads. `build_final_text` then picks the edited text up everywhere.
 - Export: `build_final_text(base_text, suggestions)` merges ACCEPTED changes;
-  keep it the single merge path for both DOCX and PDF.
+  it is the single merge path used for scoring, the cover letter, and the
+  input to every download (DOCX, PDF, LaTeX). The CV *layout* has a single
+  source too: `CV_LAYOUT` in `backend/app/services/export.py` mirrors the pinned
+  preamble in `backend/app/services/latex.py`, and both the DOCX and PDF
+  renderers read it — never style those renderers ad hoc.
