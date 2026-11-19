@@ -33,13 +33,14 @@ direct calls.
 | `DATABASE_URL` | `postgresql+psycopg2://localhost:5432/resumaxxing` | SQLAlchemy URL |
 | `UPLOAD_DIR` | `uploads` (relative to backend CWD) | uploaded CV files |
 | `DEFAULT_USER_EMAIL` | `local@resumaxxing.dev` | single-user identity |
-| `SECRET_KEY` | dev placeholder | derives the Fernet key that encrypts API keys at rest |
+| `SECRET_KEY` | dev placeholder | derives the Fernet key that encrypts API keys and Claude OAuth tokens at rest |
 | `APP_PASSWORD` | empty (disabled) | optional single-password gate for every `/api` route |
 | `SCRAPE_MAX_BYTES` | `2000000` | JD URL response size cap |
 | `SCRAPE_TIMEOUT` | `15` | JD URL request timeout (seconds) |
 
-`SECRET_KEY` must stay stable: changing it makes previously stored API keys
-undecryptable (they can be re-entered on the Settings page). Generate one with
+`SECRET_KEY` must stay stable: changing it makes previously stored API keys and
+Claude OAuth tokens undecryptable (re-enter the key or sign in again on the
+Settings page). Generate one with
 `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
 
 ## API reference
@@ -48,7 +49,10 @@ undecryptable (they can be re-entered on the Settings page). Generate one with
 |---|---|---|
 | GET / PUT | `/api/settings` | LLM provider, API keys (masked in responses), base URLs, default models, LinkedIn URL. PUT is a true partial update. |
 | POST | `/api/settings/providers/models` | `{provider, api_key?, base_url?}` → `{models: [...]}` from the provider; a blank key uses the saved one. |
-| DELETE | `/api/settings/providers/{provider}` | Clear that provider's key, base URL and default model (active provider falls back to `mock`). |
+| DELETE | `/api/settings/providers/{provider}` | Clear that provider's key, base URL and default model (active provider falls back to `mock`). For `claude` this also signs out the subscription session. |
+| POST | `/api/settings/claude/oauth/start` | Begin Claude subscription sign-in → `{authorize_url, state, code_verifier}` (PKCE; open the URL, then paste the code back). |
+| POST | `/api/settings/claude/oauth/exchange` | `{code, state, code_verifier}` → store encrypted tokens, switch Claude to OAuth mode, return settings. Bogus codes are 400. |
+| DELETE | `/api/settings/claude/oauth` | Sign out of the subscription session (clears tokens, mode back to API key; provider falls back to `mock` when no key remains). |
 | POST | `/api/cv/upload` | multipart `file` (pdf/docx/txt) → parse + store |
 | GET | `/api/cv/latest` | most recent CV |
 | POST | `/api/reviews` | `{jd_text}` or `{jd_url}`, optional `llm_provider` (`mock\|claude\|ollama\|opencode\|opencode_go`) + `llm_model` → **202** with `run_state: "running"`; the JD is scraped first (bad URLs still 400), then the LLM review runs in the background. The choice is pinned on the review. |
@@ -58,9 +62,8 @@ undecryptable (they can be re-entered on the Settings page). Generate one with
 | PUT | `/api/reviews/{id}/suggestions/{sid}/text` | `{suggested_text}` → save the user's own wording for an ADD/UPDATE suggestion. The first AI text is kept in `original_suggested_text`; status is untouched, no LLM call, stored downloads are cleared. REMOVE and blank text are 400/422. |
 | DELETE | `/api/reviews/{id}/suggestions/{sid}/text` | restore the AI wording saved in `original_suggested_text` and clear it; 400 when there is nothing to restore. |
 | POST | `/api/reviews/{id}/rescore` | re-score from current accepted/rejected/pending choices (one LLM call) → score, ATS requirements + coverage, new history entry |
-| POST | `/api/reviews/{id}/requirements/refresh` | re-extract the JD requirement list (one LLM call) and return the review; 502 when the provider fails |
 | POST | `/api/reviews/{id}/finalize?format=docx\|pdf\|tex` | rewrite the CV (stored, reused on repeat): `docx`/`pdf` render the structured document in the LaTeX template's layout, `tex` returns a LaTeX source file. Any suggestion decision or text edit clears the stored outputs. |
-| POST | `/api/reviews/{id}/cover-letter` | generate from the finalized CV + JD (409 until finalized) |
+| POST | `/api/reviews/{id}/cover-letter` | generate from your CV with accepted suggestions + JD; no finalize needed |
 | PUT | `/api/reviews/{id}/cover-letter` | save edits `{text}` |
 | POST | `/api/reviews/{id}/cover-letter/export?format=docx\|pdf` | download the saved letter |
 | GET | `/api/auth` | `{required: bool}` — whether a password is configured |
@@ -74,9 +77,13 @@ Creating a review no longer blocks on the model. `POST /api/reviews` persists th
 row (`run_state="running"`), schedules `_run_review` on the running event loop
 and returns immediately, so the modal navigates straight to
 `/reviews/{id}`. That page subscribes to `GET /api/reviews/{id}/events` and
-renders a thinking panel: four stages (job description → CV scan → drafting
-suggestions → scoring), each with the model's own streamed text nested under
-the active one. Reasoning-capable models surface
+renders a thinking panel: five stages (job description → CV scan → ATS
+requirements → drafting suggestions → scoring), each with the model's own
+streamed text nested under the active one. Requirement extraction is not an
+input to the suggestion/scoring prompt, so it runs **concurrently** with the
+generation call (the panel keeps its stage row spinning until its result lands);
+the initial review needs only one generation call because the score is part of
+the suggestion payload. Reasoning-capable models surface
 `reasoning_content`/`thinking` deltas; once the JSON payload starts, the panel
 shows a "composing" state instead of dumping raw JSON. On `done` the page
 re-fetches the review and swaps to the normal view with no reload.
@@ -99,9 +106,11 @@ blocks other requests; JD scraping runs in a worker thread.
 
 ## Database schema
 
-Alembic-managed (`backend/alembic/`; revisions `78c3f4a7ed00` → `9e44b4ed5fa0`):
+Alembic-managed (`backend/alembic/`; revisions `78c3f4a7ed00` → `650b8061ba72`):
 `users`, `user_settings` (provider + encrypted keys + base URLs + default models
-+ LinkedIn URL),
++ LinkedIn URL + encrypted Claude OAuth session: `claude_auth_mode`,
+`claude_oauth_access_token`, `claude_oauth_refresh_token`,
+`claude_oauth_expires_at`, `claude_oauth_account`),
 `base_cvs` (file path + parsed text),
 `job_descriptions` (URL + raw text + resolved `title`/`company`),
 `cv_reviews` (score, draft/finalized, pinned `llm_provider`/`llm_model`,
@@ -122,10 +131,16 @@ Migrations: edit `backend/app/models.py`, then
 `user_settings.llm_provider` for reviews created before this existed. Model
 resolution is per-review `llm_model` → provider default saved in Settings →
 built-in default (`claude-sonnet-4-5`, `gpt-oss:120b-cloud`, `grok-code`,
-`glm-5.3`).
+`deepseek-v4.1-flash`). Keep the built-in defaults in step with each provider's
+current model catalog: a retired model makes every review that does not pin one
+fail (OpenCode Go removed `glm-5.3`, so it is no longer the default).
 
 - `mock` (default) — deterministic keyword-overlap heuristic, no keys needed
-- `claude` — Anthropic Messages API (`claude_key`)
+- `claude` — Anthropic Messages API; use `claude_key` or sign in with a Claude
+  subscription (OAuth). When `claude_auth_mode = 'oauth'` and a refresh token is
+  stored, OAuth wins over the key: requests send `Authorization: Bearer …` with
+  `anthropic-beta: oauth-2025-04-20` and no `x-api-key`. Access tokens refresh
+  automatically; the rotated refresh token is persisted.
 - `ollama` — Ollama Cloud, OpenAI-compatible `/v1` (`ollama_key`); point the base
   URL at `http://localhost:11434` to use a local daemon instead
 - `opencode` — Opencode Zen, OpenAI-compatible (`opencode_key`)
@@ -136,15 +151,20 @@ built-in default (`claude-sonnet-4-5`, `gpt-oss:120b-cloud`, `grok-code`,
 
 Each provider row in Settings can override its base URL and default model. The
 Settings page lists models from `{base}/v1/models` with the typed or saved key
-(`services/model_catalog.py`) and caches the result in `localStorage`; the New
+(or the Claude OAuth bearer token when the subscription is connected;
+`services/model_catalog.py`) and caches the result in `localStorage`; the New
 Review modal reuses that catalog for its model picker.
 
 Review prompts ask for a short prose analysis *before* the JSON so the thinking
 panel has something human-readable to stream; `_extract_json` tolerates leading
-prose. The payloads stay structured: suggestions (`type`, `target_section`,
-`original_text`, `suggested_text`, `reasoning`), a scoring call returning
-`{"score": 0-100}`, and a finalize rewrite returning
-`{name, headline, contact[], sections[{heading, bullets[]}]}`. The structured
+prose. The payloads stay structured: one initial-review call returning
+`{"score": 0-100, "suggestions": [{"type", "target_section", "original_text",
+"suggested_text", "reasoning"}]}`, a standalone scoring call returning
+`{"score": 0-100}` for `/rescore` (both share `SCORE_RUBRIC`, which asks the
+model to score the CV *as provided*), and a finalize rewrite returning
+`{name, headline, contact[], sections[{heading, bullets[]}]}`. A payload without
+a usable score (or a legacy top-level suggestion array) falls back to one
+standalone scoring call, so the review never ends scoreless. The structured
 rewrite applies the same top-tier content standards as the LaTeX rewrite
 (summary first, reverse-chronological action-verb bullets, grouped skills, no
 invented facts) so Word, PDF and LaTeX read alike. Cover letters are
@@ -163,11 +183,15 @@ deterministic structurer in `services/document.py`, so finalize never breaks.
 `services/requirements.py` owns the ATS signal, split into two halves:
 
 - **Extraction** (`llm.extract_requirements`) runs once per review with the
-  pinned provider and stores `{label, canonical, aliases, importance, category,
-  quote}` on `job_descriptions.jd_requirements`. `importance` is `must` or
-  `nice`; `quote` is the JD line that asked for it, shown as evidence in the
-  panel. Alias lists let a category ("front-end frameworks") be satisfied by a
-  concrete tool ("React").
+  pinned provider, in parallel with the suggestion/score generation call, and
+  stores `{label, canonical, aliases, importance, category, quote}` on
+  `job_descriptions.jd_requirements`. The model is asked for 8–20 atomic labels
+  with up to four aliases; `quote` is derived locally from the JD
+  (`requirements.quote_for`) instead of being returned by the model, and is
+  shown as evidence in the panel. A review whose posting text and provider match
+  a completed earlier review reuses that stored list instead of calling the
+  model again. `importance` is `must` or `nice`; alias lists let a category
+  ("front-end frameworks") be satisfied by a concrete tool ("React").
 - **Matching** is deterministic and provider-independent: word-boundary regexes
   plus the surface forms in `services/skills_aliases.py`. `java` never matches
   inside `javascript`, and CJK-free skills like `C++`/`C#`/`.net` are matched
@@ -190,6 +214,10 @@ The `mock` score is exactly that old coverage number.
   from `SECRET_KEY`) and never returned in plaintext — `GET /api/settings` shows
   masks like `sk-ant…wxyz`. Legacy plaintext values still decrypt and are
   re-encrypted on the next save.
+- Claude OAuth access/refresh tokens use the same encryption and are never
+  returned by the API; settings only expose connection state, account label and
+  access-token expiry. Refresh tokens rotate, so the new pair is persisted
+  immediately and guarded against overwriting a newer sign-in.
 - `PUT /api/settings` uses `exclude_unset` semantics, and blank/masked key
   fields never overwrite a stored key.
 - Model-list lookups accept a transient key for the request only; the key is
@@ -205,6 +233,10 @@ The `mock` score is exactly that old coverage number.
 ## Known limitations
 
 - No multi-user accounts or sessions — a single default user is auto-provisioned.
+- Claude subscription sign-in reuses Claude Code's undocumented OAuth client and
+  endpoints (`services/claude_oauth.py`); Anthropic can change or restrict this
+  at any time, and subscription usage limits still apply. The API-key path is
+  the supported fallback.
 - No automated tests yet; verification is manual (curl + browser).
 - Review runs are single-process only: the progress broker is in-memory, so the
   app must be served by one uvicorn worker. The thinking transcript is not

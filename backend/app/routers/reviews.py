@@ -44,6 +44,34 @@ def _requirements_for(job: JobDescription | None) -> list:
     return requirements.from_heuristic(job.raw_text)
 
 
+def _stored_requirements(db: Session, user_id: int, jd_text: str,
+                         provider: str) -> list | None:
+    """Reuse a requirement list already extracted for this posting.
+
+    Matched on provider as well as text so a ``mock`` review's heuristic list
+    is never passed off as another provider's extraction. Only completed runs
+    are considered: requirements are persisted in the same commit that marks
+    the run complete.
+    """
+    row = (
+        db.query(JobDescription.jd_requirements)
+        .join(CVReview, CVReview.job_description_id == JobDescription.id)
+        .filter(
+            CVReview.user_id == user_id,
+            CVReview.llm_provider == provider,
+            CVReview.run_state == "complete",
+            JobDescription.raw_text == jd_text,
+            JobDescription.jd_requirements.isnot(None),
+        )
+        .order_by(CVReview.created_at.desc())
+        .first()
+    )
+    if row is None:
+        return None
+    cached = row[0]
+    return cached if isinstance(cached, list) and cached else None
+
+
 def _serialize(review: CVReview) -> ReviewOut:
     job = review.job_description
     cov = requirements.match_requirements(
@@ -141,10 +169,16 @@ async def _run_review(review_id: int, cv_text: str, jd_text: str,
             progress.emit(review_id, {"type": "error", "message": "Review not found"})
             return
         settings = _get_user_settings(db, review.user_id)
+        hint = None
+        if review.job_description is not None:
+            hint = requirements.parse_requirements(
+                review.job_description.jd_requirements or []
+            ) or None
         try:
             score, suggestions, reqs = await llm.llm_review_streaming(
                 cv_text, jd_text, settings, provider=provider, model=model,
                 emit=lambda event: progress.emit(review_id, event),
+                requirements_hint=hint,
             )
             if review.job_description is not None:
                 review.job_description.jd_requirements = [
@@ -222,6 +256,7 @@ async def create_review(payload: ReviewCreate, db: Session = Depends(get_db)):
     jd = JobDescription(
         user_id=user.id, source_url=payload.jd_url, raw_text=jd_text,
         title=jd_title, company=jd_company,
+        jd_requirements=_stored_requirements(db, user.id, jd_text, provider),
     )
     db.add(jd)
     db.flush()
@@ -480,28 +515,6 @@ async def rescore_review(review_id: int, db: Session = Depends(get_db)):
     )
 
 
-@router.post("/{review_id}/requirements/refresh", response_model=ReviewOut)
-async def refresh_requirements(review_id: int, db: Session = Depends(get_db)):
-    """Re-extract the JD requirement list (one LLM call) and return the review."""
-    review = _get_review(db, review_id)
-    settings = _get_user_settings(db, review.user_id)
-    try:
-        reqs = await llm.extract_requirements(
-            review.job_description.raw_text, settings,
-            provider=review.llm_provider, model=review.llm_model,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502, detail=f"Requirement extraction failed: {exc}"
-        )
-    review.job_description.jd_requirements = [
-        r.model_dump(exclude={"matched"}) for r in reqs
-    ]
-    db.commit()
-    db.refresh(review)
-    return _serialize(review)
-
-
 @router.post("/{review_id}/finalize")
 async def finalize_review(review_id: int, format: str = "docx",
                           db: Session = Depends(get_db)):
@@ -574,9 +587,6 @@ async def finalize_review(review_id: int, format: str = "docx",
 @router.post("/{review_id}/cover-letter", response_model=CoverLetterOut)
 async def generate_cover_letter(review_id: int, db: Session = Depends(get_db)):
     review = _get_review(db, review_id)
-    if review.status != ReviewStatus.finalized:
-        raise HTTPException(status_code=409,
-                            detail="Finalize the CV before generating a cover letter")
     settings = _get_user_settings(db, review.user_id)
     text = await llm.generate_cover_letter(
         _pending_cv_text(review),

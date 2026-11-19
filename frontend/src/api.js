@@ -66,6 +66,26 @@ export async function deleteProvider(provider) {
   })).json()
 }
 
+export async function startClaudeOAuth() {
+  return (await request('/settings/claude/oauth/start', {
+    method: 'POST',
+  })).json()
+}
+
+export async function exchangeClaudeOAuth({ code, state, code_verifier }) {
+  return (await request('/settings/claude/oauth/exchange', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, state, code_verifier }),
+  })).json()
+}
+
+export async function disconnectClaudeOAuth() {
+  return (await request('/settings/claude/oauth', {
+    method: 'DELETE',
+  })).json()
+}
+
 export async function uploadCv(file) {
   const form = new FormData()
   form.append('file', file)
@@ -174,12 +194,6 @@ export async function resetSuggestionText(reviewId, suggestionId) {
 
 export async function rescoreReview(id) {
   return (await request(`/reviews/${id}/rescore`, { method: 'POST' })).json()
-}
-
-export async function refreshRequirements(id) {
-  return (await request(`/reviews/${id}/requirements/refresh`, {
-    method: 'POST',
-  })).json()
 }
 
 export async function finalizeReview(id, format) {

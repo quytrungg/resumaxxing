@@ -5,6 +5,7 @@ import ModelSelect from './ModelSelect'
 import {
   PROVIDERS as LLM_PROVIDERS,
   PROVIDER_MAP,
+  isProviderConfigured,
   loadCatalog,
   rememberModels,
 } from '../llmProviders'
@@ -171,13 +172,16 @@ export default function NewReviewModal({ onClose }) {
                   {PROVIDERS.map((p) => {
                     const providerSpec = PROVIDER_MAP[p.value]
                     const mask = providerSpec ? savedSettings?.[providerSpec.keyField] : ''
+                    const subscribed = p.value === 'claude'
+                      && Boolean(savedSettings?.claude_oauth_connected)
                     const configured = p.value === 'mock'
-                      || Boolean(mask)
+                      || isProviderConfigured(savedSettings, providerSpec)
                       || savedProvider === p.value
+                    const suffix = mask || (subscribed ? 'subscription' : '')
                     return (
                       <option key={p.value} value={p.value} disabled={!configured}>
-                        {mask
-                          ? `${p.label} · ${mask}`
+                        {suffix
+                          ? `${p.label} · ${suffix}`
                           : `${p.label}${configured ? '' : ' — no key saved'}`}
                       </option>
                     )

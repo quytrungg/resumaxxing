@@ -63,8 +63,6 @@ export default function KeywordPanel({
   requirements = [],
   matched = [],
   missing = [],
-  onRefresh,
-  refreshing = false,
 }) {
   const [selected, setSelected] = useState(null)
 
@@ -77,21 +75,9 @@ export default function KeywordPanel({
     <div>
       <div className="flex items-baseline justify-between mb-2 gap-2">
         <h3 className="font-semibold text-sm">ATS keyword coverage</h3>
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-gray-500 dark:text-gray-400">
-            {coverage}% of JD requirements
-          </span>
-          {onRefresh && (
-            <button
-              type="button"
-              onClick={onRefresh}
-              disabled={refreshing}
-              className="text-xs px-2 py-0.5 rounded border border-gray-300 text-gray-600 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
-            >
-              {refreshing ? 'Extracting…' : 'Refresh'}
-            </button>
-          )}
-        </div>
+        <span className="text-xs text-gray-500 dark:text-gray-400">
+          {coverage}% of JD requirements
+        </span>
       </div>
 
       <div className="h-2 w-full rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden">

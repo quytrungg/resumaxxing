@@ -67,6 +67,16 @@ Rules and repo knowledge for any agent working in this repository.
   work runs in a background task streamed over SSE. Never move provider calls
   back into the request handler, and keep provider I/O async (`AsyncClient`) so
   one review cannot freeze the API.
+- The initial review is one generation call: `SUGGESTION_PROMPT` asks for
+  `{score, suggestions}` and ATS requirement extraction runs concurrently with
+  it. Never make the requirement list an input to the suggestion or scoring
+  prompts, and keep `/rescore` on the standalone `SCORING_PROMPT` so
+  re-evaluation stays independent of the initial score.
+- Claude auth: `user_settings.claude_auth_mode='oauth'` (with a refresh token)
+  takes precedence over `claude_key`; `services/claude_oauth.py` owns sign-in,
+  refresh and token persistence. OAuth calls send `Authorization: Bearer` plus
+  `anthropic-beta: oauth-2025-04-20` and must not send `x-api-key`. Tokens are
+  encrypted, never returned by the API, and never logged.
 - All suggestion status changes go through the PATCH endpoint, which only
   updates the status (and invalidates the stored download outputs:
   `final_document` + `final_latex`). Scoring is

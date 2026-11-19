@@ -44,6 +44,12 @@ class UserSettings(Base):
     user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
     llm_provider = Column(String(50), default="mock")  # claude | ollama | opencode | opencode_go | mock
     claude_key = Column(Text, nullable=True)
+    # Claude subscription sign-in (null/"api_key" = use claude_key).
+    claude_auth_mode = Column(String(20), nullable=True)
+    claude_oauth_access_token = Column(Text, nullable=True)
+    claude_oauth_refresh_token = Column(Text, nullable=True)
+    claude_oauth_expires_at = Column(DateTime, nullable=True)
+    claude_oauth_account = Column(String(255), nullable=True)
     ollama_key = Column(Text, nullable=True)
     opencode_key = Column(Text, nullable=True)
     opencode_go_key = Column(Text, nullable=True)

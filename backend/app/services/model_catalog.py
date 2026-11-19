@@ -9,7 +9,7 @@ from typing import List, Optional
 import httpx
 
 from app.models import UserSettings
-from app.services import crypto
+from app.services import claude_oauth, crypto
 
 PROVIDERS = {
     "claude": {
@@ -42,7 +42,7 @@ PROVIDERS = {
         "base_url_field": "opencode_go_base_url",
         "model_field": "opencode_go_model",
         "default_base_url": "https://opencode.ai/zen/go",
-        "default_model": "glm-5.3",
+        "default_model": "deepseek-v4.1-flash",
     },
 }
 
@@ -123,9 +123,26 @@ async def list_models(provider: str,
         raise ModelListError(f"Unknown provider: {provider}")
 
     spec = PROVIDERS[provider]
-    key = resolve_api_key(settings, provider, api_key)
-    if not key and provider != "ollama":
-        raise ModelListError(f"Add a {spec['label']} API key first.")
+    typed_key = (api_key or "").strip()
+    use_oauth = (
+        provider == "claude"
+        and claude_oauth.is_connected(settings)
+        and (not typed_key or MASK_MARK in typed_key)
+    )
+    if use_oauth:
+        try:
+            token = await claude_oauth.ensure_access_token(settings)
+        except claude_oauth.ClaudeOAuthError as exc:
+            raise ModelListError(str(exc))
+        headers = {
+            **claude_oauth.inference_headers(token),
+            "accept": "application/json",
+        }
+    else:
+        key = resolve_api_key(settings, provider, api_key)
+        if not key and provider != "ollama":
+            raise ModelListError(f"Add a {spec['label']} API key first.")
+        headers = _headers(provider, key)
     base = resolve_base_url(settings, provider, base_url)
     url = f"{base}/v1/models"
 
@@ -133,7 +150,7 @@ async def list_models(provider: str,
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
             resp = await client.get(
                 url,
-                headers=_headers(provider, key),
+                headers=headers,
                 params={"limit": 1000} if provider == "claude" else None,
             )
     except httpx.TimeoutException:
@@ -144,6 +161,10 @@ async def list_models(provider: str,
         )
 
     if resp.status_code in (401, 403):
+        if use_oauth:
+            raise ModelListError(
+                "Claude rejected the subscription session. Sign in again from Settings."
+            )
         raise ModelListError(f"{spec['label']} rejected the API key.")
     if resp.status_code == 404:
         raise ModelListError(

@@ -20,26 +20,32 @@ function buildStages(events, error) {
         detail: '',
         thinking: '',
         composing: false,
+        parallel: false,
+        finished: false,
       })
     }
     const stage = seen.get(event.stage)
     if (event.type === 'stage') {
       stage.label = event.label || stage.label
       stage.detail = event.text || ''
+      // A stage flagged `parallel` is still running even after the next stage
+      // becomes active; it only completes when its own delta arrives.
+      if (event.parallel) stage.parallel = true
     } else if (event.kind === 'thinking') {
       stage.thinking += event.text
+      stage.finished = true
     } else if (event.kind === 'output') {
       stage.composing = true
+      stage.finished = true
     }
   }
 
+  const terminal = events.some((e) => e.type === 'done' || e.type === 'error')
   let activeKey = null
-  if (!error) {
+  if (!error && !terminal) {
     for (const event of events) {
       if (event?.type === 'stage') activeKey = event.stage
     }
-    const terminal = events.some((e) => e.type === 'done' || e.type === 'error')
-    if (terminal) activeKey = null
   }
 
   const ordered = STAGES.map((stage, index) => {
@@ -48,6 +54,9 @@ function buildStages(events, error) {
     let status = 'pending'
     if (found) status = active ? 'active' : 'done'
     if (found && !activeKey) status = 'done'
+    if (found?.parallel && !found.finished && !terminal && !error) {
+      status = 'active'
+    }
     return {
       ...stage,
       detail: found?.detail || '',

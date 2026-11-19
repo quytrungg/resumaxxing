@@ -2,6 +2,7 @@
 deterministic local heuristic fallback so the app runs end-to-end
 without any API keys.
 """
+import asyncio
 import hashlib
 import json
 import logging
@@ -12,23 +13,31 @@ import httpx
 
 from app.models import UserSettings
 from app.schemas import LLMSuggestion, StructuredCV
-from app.services import crypto, keywords, latex, requirements
+from app.services import claude_oauth, crypto, keywords, latex, requirements
 from app.services.document import structure_text
 from app.services.model_catalog import PROVIDERS, stored_base_url
 
 logger = logging.getLogger(__name__)
 
+SCORE_RUBRIC = (
+    "Score the CV as provided, before applying any of your own suggestions: "
+    "0 means no alignment and 100 means an ideal match. Weigh requirements the "
+    "posting states as mandatory more heavily than optional ones."
+)
+
 SUGGESTION_PROMPT = (
     "You are an expert tech recruiter. Compare this CV to this Job Description. "
     "First write 3-5 short sentences of plain-text analysis: which requirements "
     "the CV already covers, which are missing, and what the highest-leverage "
-    "changes are. Then, on its own, output a JSON array of suggestions with keys: "
+    "changes are. Then, on its own, output a single JSON object with keys "
+    "`score` (an integer from 0 to 100) and `suggestions` (an array of objects "
+    "with keys: "
     "`type` (exactly one of ADD, REMOVE, UPDATE), `target_section` (e.g., "
     "Experience, Skills), `original_text` (the existing text being changed; "
     "required for REMOVE and UPDATE), `suggested_text` (the replacement text; "
     "required for ADD and UPDATE, use an empty string for REMOVE), and "
-    "`reasoning`. The analysis must come before the JSON. No markdown, no code "
-    "fences: prose followed by valid JSON."
+    "`reasoning`. " + SCORE_RUBRIC + " The analysis must come before the JSON. "
+    "No markdown, no code fences: prose followed by valid JSON."
 )
 
 REQUIREMENTS_PROMPT = (
@@ -37,7 +46,7 @@ REQUIREMENTS_PROMPT = (
     "assessed on: technologies, languages, frameworks, platforms, tools, cloud "
     "services, methodologies and named domain skills.\n"
     "Rules:\n"
-    "- Return 10 to 25 items, most important first.\n"
+    "- Return 8 to 20 items, most important first.\n"
     "- Each `label` is an ATOMIC TERM of one to four words that a keyword "
     "scanner could search for: a technology, product, protocol, platform, "
     "language, library, methodology or skills-section phrase (\"PostgreSQL\", "
@@ -49,8 +58,8 @@ REQUIREMENTS_PROMPT = (
     "\"understanding of\", \"ability to\".\n"
     "- When the posting names a category instead of specific entries "
     "(\"front-end frameworks\", \"testing frameworks\"), use the category as "
-    "the label and put up to six concrete technologies that would satisfy it in "
-    "`aliases` (\"react\", \"vue\", \"angular\"). This is what lets a CV that "
+    "the label and put up to four concrete technologies that would satisfy it "
+    "in `aliases` (\"react\", \"vue\", \"angular\"). This is what lets a CV that "
     "says \"React\" count as covering \"front-end frameworks\".\n"
     "- Prefer specific terms the posting names (\"PostgreSQL\", \"CI/CD\") over "
     "generic ones (\"databases\", \"teamwork\").\n"
@@ -60,7 +69,7 @@ REQUIREMENTS_PROMPT = (
     "\"CI/CD\", \"C++\", \"OpenTelemetry\").\n"
     "- `canonical` is a lowercase canonical term (\"kubernetes\" for "
     "\"Kubernetes\").\n"
-    "- `aliases` lists up to six surface forms that should satisfy the item: "
+    "- `aliases` lists up to four surface forms that should satisfy the item: "
     "other spellings for a technology (\"k8s\", \"postgres\") or the concrete "
     "tools behind a category. Use an empty array when there are none.\n"
     "- `importance` is \"must\" for mandatory requirements and \"nice\" for "
@@ -68,17 +77,16 @@ REQUIREMENTS_PROMPT = (
     "Default to \"must\".\n"
     "- `category` is one short word: language, framework, cloud, data, infra, "
     "tooling, practice or domain.\n"
-    "- `quote` is the verbatim sentence or bullet from the posting that "
-    "justifies the item; never invent text.\n"
     "Return ONLY a JSON array of objects with keys `label`, `canonical`, "
-    "`aliases`, `importance`, `category`, `quote`. No markdown, no prose."
+    "`aliases`, `importance`, `category`. No markdown, no prose."
 )
 
 SCORING_PROMPT = (
     "Evaluate how well this CV matches this Job Description. First write 1-3 "
     "short sentences explaining the strongest matches and the biggest gaps, then "
     "output a JSON object with a single key \"score\" containing an integer from "
-    "0 to 100. The analysis must come before the JSON, with no markdown."
+    "0 to 100. " + SCORE_RUBRIC + " The analysis must come before the JSON, with "
+    "no markdown."
 )
 
 REWRITE_PROMPT = (
@@ -308,20 +316,30 @@ def _session_id(provider: str, cv_text: str, jd_text: str) -> str:
 TIMEOUT = httpx.Timeout(connect=15.0, read=180.0, write=30.0, pool=15.0)
 
 
-def _request_spec(provider: str, settings: UserSettings, system: str, user: str,
-                  model: Optional[str], session: Optional[str],
-                  stream: bool) -> tuple[str, dict, dict]:
+async def _request_spec(provider: str, settings: UserSettings, system: str,
+                        user: str, model: Optional[str], session: Optional[str],
+                        stream: bool) -> tuple[str, dict, dict]:
     """Build (url, headers, json) for the provider's chat endpoint."""
     if provider == "claude":
         base = stored_base_url(settings, provider)
-        return (
-            f"{base}/v1/messages",
-            {
+        if claude_oauth.is_connected(settings):
+            headers = {
+                **claude_oauth.inference_headers(
+                    await claude_oauth.ensure_access_token(settings)
+                ),
+                "content-type": "application/json",
+                "accept": "text/event-stream" if stream else "application/json",
+            }
+        else:
+            headers = {
                 "x-api-key": crypto.decrypt(settings.claude_key) or "",
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
                 "accept": "text/event-stream" if stream else "application/json",
-            },
+            }
+        return (
+            f"{base}/v1/messages",
+            headers,
             {
                 "model": model or DEFAULT_MODELS["claude"],
                 "max_tokens": 4096,
@@ -360,7 +378,7 @@ async def _chat_completion(provider: str, settings: UserSettings,
                            model: Optional[str] = None,
                            session: Optional[str] = None) -> str:
     """Non-streaming completion. Async so it never blocks the event loop."""
-    url, headers, payload = _request_spec(
+    url, headers, payload = await _request_spec(
         provider, settings, system, user, model, session, stream=False
     )
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -417,7 +435,7 @@ async def _stream_chat_completion(provider: str, settings: UserSettings,
     Reasoning text is forwarded to ``on_delta`` as ``"thinking"`` but is never
     part of the returned string, so JSON parsing sees only the answer.
     """
-    url, headers, payload = _request_spec(
+    url, headers, payload = await _request_spec(
         provider, settings, system, user, model, session, stream=True
     )
     collected: List[str] = []
@@ -463,8 +481,12 @@ def _emit(emit: Optional[Callable[[dict], None]], event: dict) -> None:
         logger.debug("progress emit failed", exc_info=True)
 
 
-def _stage(emit, stage: str, label: str, text: str = "") -> None:
-    _emit(emit, {"type": "stage", "stage": stage, "label": label, "text": text})
+def _stage(emit, stage: str, label: str, text: str = "",
+           parallel: bool = False) -> None:
+    event = {"type": "stage", "stage": stage, "label": label, "text": text}
+    if parallel:
+        event["parallel"] = True
+    _emit(emit, event)
 
 
 def _delta(emit, stage: str, kind: str, text: str) -> None:
@@ -526,38 +548,28 @@ async def extract_requirements(jd_text: str,
     found = requirements.parse_requirements(items)
     if not found:
         raise ValueError("The model returned no usable requirements")
+    # The quote is no longer part of the model's payload: derive it from the
+    # posting so the panel still shows the sentence that justifies each item.
+    for item in found:
+        if not item.quote:
+            item.quote = requirements.quote_for(jd_text, item.label)
     return found
 
 
-async def llm_review_streaming(cv_text: str, jd_text: str,
-                               settings: Optional[UserSettings],
-                               provider: Optional[str] = None,
-                               model: Optional[str] = None,
-                               emit: Optional[Callable[[dict], None]] = None
-                               ) -> tuple[int, List[LLMSuggestion],
-                                          List[requirements.Requirement]]:
-    """Run the review pipeline, narrating real progress as it goes.
-
-    Emits ``stage`` events for jd/cv/requirements/suggestions/score plus
-    ``delta`` events carrying the model's own streamed text. ``emit=None`` is
-    the non-streaming path used by callers that only need the result.
-
-    The extracted requirement list is returned so the caller can persist it on
-    the job description; matching stays deterministic.
-    """
-    provider, model = resolve_choice(settings, provider, model)
-
-    _stage(emit, "jd", "Reading the job description",
-           f"{len(jd_text):,} characters")
-    _stage(emit, "cv", "Scanning your CV", f"{len(cv_text):,} characters")
-    _stage(emit, "requirements", "Extracting ATS requirements",
-           "local heuristic" if provider == "mock"
-           else f"{provider} - {model or 'provider default'}")
+def _parse_score(payload) -> Optional[int]:
+    """The combined payload's score, or ``None`` when absent/unusable."""
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("score")
     try:
-        reqs = await extract_requirements(jd_text, settings, provider, model)
-    except Exception as exc:  # a keyword list must never sink the whole review
-        logger.warning("requirement extraction failed, using heuristic: %s", exc)
-        reqs = requirements.from_heuristic(jd_text)
+        score = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(100, score))
+
+
+def _requirements_narration(emit, reqs, cv_text) -> dict:
+    """Emit the ATS result line and return the deterministic coverage dict."""
     cov = requirements.match_requirements(cv_text, reqs)
     _delta(emit, "requirements", "thinking",
            f"{len(reqs)} requirements identified"
@@ -567,6 +579,73 @@ async def llm_review_streaming(cv_text: str, jd_text: str,
            f"({cov['coverage']}% weighted coverage).\n"
            + (f"Missing: {', '.join(cov['missing_labels'][:12])}.\n"
               if cov["missing"] else "Every requirement already appears.\n"))
+    return cov
+
+
+async def _requirements_stage(cv_text: str, jd_text: str,
+                              settings: Optional[UserSettings],
+                              provider: str, model: Optional[str],
+                              emit) -> List[requirements.Requirement]:
+    """Extraction running alongside the generation call. Never raises."""
+    try:
+        reqs = await extract_requirements(jd_text, settings, provider, model)
+    except Exception as exc:  # a keyword list must never sink the whole review
+        logger.warning("requirement extraction failed, using heuristic: %s", exc)
+        reqs = requirements.from_heuristic(jd_text)
+    _requirements_narration(emit, reqs, cv_text)
+    return reqs
+
+
+async def llm_review_streaming(cv_text: str, jd_text: str,
+                               settings: Optional[UserSettings],
+                               provider: Optional[str] = None,
+                               model: Optional[str] = None,
+                               emit: Optional[Callable[[dict], None]] = None,
+                               requirements_hint: Optional[
+                                   List[requirements.Requirement]] = None
+                               ) -> tuple[int, List[LLMSuggestion],
+                                          List[requirements.Requirement]]:
+    """Run the review pipeline, narrating real progress as it goes.
+
+    Emits ``stage`` events for jd/cv/requirements/suggestions/score plus
+    ``delta`` events carrying the model's own streamed text. ``emit=None`` is
+    the non-streaming path used by callers that only need the result.
+
+    Requirement extraction is not an input to the prompts below, so for real
+    providers it runs concurrently with the single suggestion+score generation
+    call. The initial score therefore comes from that call; ``/rescore`` keeps
+    its own standalone scoring prompt. A stored list (``requirements_hint``)
+    skips extraction entirely for a posting that was already parsed.
+
+    The extracted requirement list is returned so the caller can persist it on
+    the job description; matching stays deterministic.
+    """
+    provider, model = resolve_choice(settings, provider, model)
+
+    _stage(emit, "jd", "Reading the job description",
+           f"{len(jd_text):,} characters")
+    _stage(emit, "cv", "Scanning your CV", f"{len(cv_text):,} characters")
+
+    req_task = None
+    cov = None
+    if requirements_hint:
+        reqs = list(requirements_hint)
+        _stage(emit, "requirements", "Extracting ATS requirements",
+               "reused from an earlier review")
+        cov = _requirements_narration(emit, reqs, cv_text)
+    elif provider == "mock":
+        _stage(emit, "requirements", "Extracting ATS requirements",
+               "local heuristic")
+        reqs = await extract_requirements(jd_text, settings, provider, model)
+        cov = _requirements_narration(emit, reqs, cv_text)
+    else:
+        _stage(emit, "requirements", "Extracting ATS requirements",
+               f"{provider} · {model or 'provider default'} · "
+               "in parallel with suggestions",
+               parallel=True)
+        req_task = asyncio.create_task(
+            _requirements_stage(cv_text, jd_text, settings, provider, model, emit)
+        )
 
     if provider == "mock":
         _stage(emit, "suggestions", "Drafting suggestions", "local heuristic")
@@ -585,23 +664,41 @@ async def llm_review_streaming(cv_text: str, jd_text: str,
     body = f"CV:\n{cv_text}\n\nJOB DESCRIPTION:\n{jd_text}"
     _stage(emit, "suggestions", "Drafting suggestions",
            f"{provider} · {model or 'provider default'}")
-    raw = await _stream_chat_completion(
-        provider, settings, SUGGESTION_PROMPT, body,
-        model=model, session=_session_id(provider, cv_text, jd_text),
-        on_delta=_json_splitter(emit, "suggestions"),
-    )
-    parsed = _extract_json(raw)
-    items = parsed if isinstance(parsed, list) else parsed.get("suggestions", [])
-    suggestions = _parse_suggestions(items)
+    try:
+        raw = await _stream_chat_completion(
+            provider, settings, SUGGESTION_PROMPT, body,
+            model=model, session=_session_id(provider, cv_text, jd_text),
+            on_delta=_json_splitter(emit, "suggestions"),
+        )
+        parsed = _extract_json(raw)
+        items = parsed.get("suggestions") if isinstance(parsed, dict) else parsed
+        suggestions = _parse_suggestions(items)
+        score = _parse_score(parsed)
 
-    _stage(emit, "score", "Scoring the match",
-           f"{len(suggestions)} suggestions drafted")
-    score_raw = await _stream_chat_completion(
-        provider, settings, SCORING_PROMPT, body,
-        model=model, session=_session_id(provider, cv_text, jd_text),
-        on_delta=_json_splitter(emit, "score"),
-    )
-    return int(_extract_json(score_raw)["score"]), suggestions, reqs
+        if score is None:
+            # Older/array-only payloads still get a score from the standalone
+            # prompt (the same one `/rescore` uses).
+            _stage(emit, "score", "Scoring the match",
+                   f"{len(suggestions)} suggestions · separate scoring call")
+            score_raw = await _stream_chat_completion(
+                provider, settings, SCORING_PROMPT, body,
+                model=model, session=_session_id(provider, cv_text, jd_text),
+                on_delta=_json_splitter(emit, "score"),
+            )
+            score = int(_extract_json(score_raw)["score"])
+        else:
+            _stage(emit, "score", "Scoring the match",
+                   f"{len(suggestions)} suggestions · score from the "
+                   "suggestion response")
+        _delta(emit, "score", "thinking", f"Match score {score}/100.\n")
+
+        if req_task is not None:
+            reqs = await req_task
+        return score, suggestions, reqs
+    finally:
+        # A failed generation must not leave the extraction request running.
+        if req_task is not None and not req_task.done():
+            req_task.cancel()
 
 
 async def llm_review(cv_text: str, jd_text: str,

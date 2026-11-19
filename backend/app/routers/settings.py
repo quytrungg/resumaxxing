@@ -5,8 +5,10 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import User, UserSettings
-from app.schemas import ModelListIn, SettingsIn, SettingsOut
-from app.services import crypto
+from app.schemas import (
+    ClaudeOAuthExchangeIn, ModelListIn, SettingsIn, SettingsOut,
+)
+from app.services import claude_oauth, crypto
 from app.services.model_catalog import PROVIDERS, ModelListError, list_models
 
 router = APIRouter(prefix="/api", tags=["settings"])
@@ -44,9 +46,14 @@ def mask_key(stored: Optional[str]) -> str:
 def _settings_out(s: Optional[UserSettings]) -> SettingsOut:
     if not s:
         return SettingsOut()
+    connected = claude_oauth.is_connected(s)
     return SettingsOut(
         llm_provider=s.llm_provider or "mock",
         claude_key=mask_key(s.claude_key),
+        claude_auth_mode="oauth" if connected else "api_key",
+        claude_oauth_connected=connected,
+        claude_oauth_account=s.claude_oauth_account if connected else None,
+        claude_oauth_expires_at=s.claude_oauth_expires_at if connected else None,
         ollama_key=mask_key(s.ollama_key),
         opencode_key=mask_key(s.opencode_key),
         opencode_go_key=mask_key(s.opencode_go_key),
@@ -109,7 +116,52 @@ def delete_provider_key(provider: str, db: Session = Depends(get_db)):
     setattr(s, spec["key_field"], None)
     setattr(s, spec["base_url_field"], None)
     setattr(s, spec["model_field"], None)
+    if provider == "claude":
+        claude_oauth.disconnect(s)
     if (s.llm_provider or "") == provider:
+        s.llm_provider = "mock"
+    db.commit()
+    db.refresh(s)
+    return _settings_out(s)
+
+
+@router.post("/settings/claude/oauth/start")
+def claude_oauth_start():
+    """Begin the Claude subscription sign-in (PKCE, manual code redirect)."""
+    authorize_url, state, code_verifier = claude_oauth.start()
+    return {
+        "authorize_url": authorize_url,
+        "state": state,
+        "code_verifier": code_verifier,
+    }
+
+
+@router.post("/settings/claude/oauth/exchange", response_model=SettingsOut)
+async def claude_oauth_exchange(payload: ClaudeOAuthExchangeIn,
+                                db: Session = Depends(get_db)):
+    s = _get_or_create(db)
+    try:
+        await claude_oauth.exchange(
+            s, payload.code, payload.state, payload.code_verifier
+        )
+    except claude_oauth.ClaudeOAuthError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
+    if (s.llm_provider or "mock") == "mock":
+        s.llm_provider = "claude"
+    db.commit()
+    db.refresh(s)
+    return _settings_out(s)
+
+
+@router.delete("/settings/claude/oauth", response_model=SettingsOut)
+def claude_oauth_disconnect(db: Session = Depends(get_db)):
+    user = get_default_user(db)
+    s = db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
+    if not s:
+        return SettingsOut()
+    claude_oauth.disconnect(s)
+    if (s.llm_provider or "") == "claude" and not s.claude_key:
         s.llm_provider = "mock"
     db.commit()
     db.refresh(s)

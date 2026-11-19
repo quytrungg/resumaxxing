@@ -1,27 +1,27 @@
 import { useEffect, useState } from 'react'
 import {
   deleteProvider,
+  disconnectClaudeOAuth,
+  exchangeClaudeOAuth,
   getSettings,
   listProviderModels,
   saveSettings,
+  startClaudeOAuth,
 } from '../api'
 import ModelSelect from '../components/ModelSelect'
 import {
   PROVIDERS,
   PROVIDER_MAP,
   forgetModels,
+  isProviderConfigured,
   loadCatalog,
   rememberModels,
 } from '../llmProviders'
 
-function hasStoredKey(settings, spec) {
-  return Boolean(settings?.[spec.keyField])
-}
-
 function firstProvider(settings) {
   const active = settings?.llm_provider
   if (PROVIDER_MAP[active]) return active
-  return PROVIDERS.find((p) => !hasStoredKey(settings, p))?.value || 'claude'
+  return PROVIDERS.find((p) => !isProviderConfigured(settings, p))?.value || 'claude'
 }
 
 const chipIcon = (
@@ -55,9 +55,15 @@ export default function SettingsPage() {
   const [modelsLoading, setModelsLoading] = useState(false)
   const [modelError, setModelError] = useState(null)
   const [notice, setNotice] = useState(null)
+  const [oauthFlow, setOauthFlow] = useState(null)
+  const [oauthCode, setOauthCode] = useState('')
+  const [oauthBusy, setOauthBusy] = useState(false)
+  const [oauthError, setOauthError] = useState(null)
+  const [oauthNotice, setOauthNotice] = useState(null)
 
   const spec = PROVIDER_MAP[form.provider]
   const models = catalog[form.provider] || []
+  const claudeConnected = Boolean(settings?.claude_oauth_connected)
 
   function fillForm(provider, nextSettings = settings) {
     const nextSpec = PROVIDER_MAP[provider]
@@ -79,7 +85,7 @@ export default function SettingsPage() {
         // Warm the model catalog for every configured provider so the New
         // Review modal has options immediately.
         for (const p of PROVIDERS) {
-          if (!hasStoredKey(s, p)) continue
+          if (!isProviderConfigured(s, p)) continue
           listProviderModels({ provider: p.value })
             .then((r) => setCatalog((c) => rememberModels(c, p.value, r.models)))
             .catch(() => {})
@@ -94,7 +100,7 @@ export default function SettingsPage() {
     const typedKey = form.api_key.trim()
     const localOllama = current.value === 'ollama'
       && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(form.base_url.trim())
-    const canFetch = typedKey || hasStoredKey(settings, current) || localOllama
+    const canFetch = typedKey || isProviderConfigured(settings, current) || localOllama
     if (!canFetch || (typedKey && typedKey.length < 8)) {
       setModelError(null)
       return undefined
@@ -150,7 +156,11 @@ export default function SettingsPage() {
 
   async function removeProvider(provider) {
     const target = PROVIDER_MAP[provider]
-    if (!window.confirm(`Remove the saved ${target.label} API key?`)) return
+    const oauthTarget = target.value === 'claude' && settings?.claude_oauth_connected
+    const message = oauthTarget
+      ? `Remove the saved ${target.label} API key and sign out of the subscription?`
+      : `Remove the saved ${target.label} API key?`
+    if (!window.confirm(message)) return
     setNotice(null)
     try {
       const s = await deleteProvider(provider)
@@ -171,7 +181,7 @@ export default function SettingsPage() {
   async function handleAddKey(e) {
     e.preventDefault()
     setNotice(null)
-    const savedKey = hasStoredKey(settings, spec)
+    const savedKey = isProviderConfigured(settings, spec)
     if (!form.api_key.trim() && !savedKey
         && !(spec.value === 'ollama' && form.base_url.trim())) {
       setNotice({ type: 'error', text: `Paste a ${spec.label} API key first.` })
@@ -200,6 +210,66 @@ export default function SettingsPage() {
     }
   }
 
+  async function handleOAuthStart() {
+    setOauthError(null)
+    setOauthNotice(null)
+    // Open the tab inside the click handler so pop-up blockers allow it.
+    const tab = window.open('about:blank', '_blank')
+    try {
+      const flow = await startClaudeOAuth()
+      setOauthFlow(flow)
+      setOauthCode('')
+      if (tab) tab.location.href = flow.authorize_url
+      else setOauthError('Allow pop-ups to open the Claude sign-in page.')
+    } catch (e) {
+      if (tab) tab.close()
+      setOauthError(e.message)
+    }
+  }
+
+  async function handleOAuthExchange(e) {
+    e.preventDefault()
+    if (!oauthFlow || !oauthCode.trim() || oauthBusy) return
+    setOauthBusy(true)
+    setOauthError(null)
+    try {
+      const s = await exchangeClaudeOAuth({
+        code: oauthCode.trim(),
+        state: oauthFlow.state,
+        code_verifier: oauthFlow.code_verifier,
+      })
+      setSettings(s)
+      setOauthFlow(null)
+      setOauthCode('')
+      setOauthNotice({ type: 'ok', text: 'Claude subscription connected.' })
+      fillForm('claude', s)
+      listProviderModels({ provider: 'claude' })
+        .then((r) => setCatalog((c) => rememberModels(c, 'claude', r.models)))
+        .catch((err) => setModelError(err.message))
+    } catch (err) {
+      setOauthError(err.message)
+    } finally {
+      setOauthBusy(false)
+    }
+  }
+
+  async function handleOAuthDisconnect() {
+    if (!window.confirm('Sign out of the Claude subscription?')) return
+    setOauthError(null)
+    setOauthNotice(null)
+    try {
+      const s = await disconnectClaudeOAuth()
+      setSettings(s)
+      setOauthFlow(null)
+      setOauthCode('')
+      setCatalog((c) => forgetModels(c, 'claude'))
+      fillForm('claude', s)
+      setOauthNotice({ type: 'ok', text: 'Signed out of the Claude subscription.' })
+    } catch (e) {
+      setOauthError(e.message)
+    }
+  }
+
   async function handleSaveLinkedin(e) {
     e.preventDefault()
     setNotice(null)
@@ -216,7 +286,7 @@ export default function SettingsPage() {
   }
 
   const configured = settings
-    ? PROVIDERS.filter((p) => hasStoredKey(settings, p) || settings.llm_provider === p.value)
+    ? PROVIDERS.filter((p) => isProviderConfigured(settings, p) || settings.llm_provider === p.value)
     : []
 
   return (
@@ -245,6 +315,7 @@ export default function SettingsPage() {
           {configured.map((p) => {
             const active = settings?.llm_provider === p.value
             const mask = settings?.[p.keyField]
+            const subscribed = p.value === 'claude' && claudeConnected
             const result = testResults[p.value]
             return (
               <div
@@ -268,8 +339,8 @@ export default function SettingsPage() {
                 <span className="rounded-full border border-indigo-500/40 bg-indigo-50 dark:bg-indigo-950/40 px-3 py-1 text-sm text-indigo-700 dark:text-indigo-200">
                   {p.label}
                 </span>
-                <span className={`font-mono text-sm ${mask ? 'text-gray-700 dark:text-gray-300' : 'text-red-500'}`}>
-                  {mask || 'no key saved'}
+                <span className={`font-mono text-sm ${mask || subscribed ? 'text-gray-700 dark:text-gray-300' : 'text-red-500'}`}>
+                  {subscribed ? 'subscription sign-in' : (mask || 'no key saved')}
                 </span>
                 {active && (
                   <span className="inline-flex items-center gap-1 rounded-full border border-green-500/40 bg-green-50 dark:bg-green-950/30 px-2.5 py-1 text-xs font-medium text-green-700 dark:text-green-300">
@@ -319,6 +390,89 @@ export default function SettingsPage() {
 
           <form onSubmit={handleAddKey}
             className="rounded-lg border border-dashed border-gray-300 dark:border-gray-600 p-4 space-y-3">
+            {spec.value === 'claude' && (
+              <div className="rounded-lg border border-indigo-200 dark:border-indigo-500/40 bg-indigo-50/40 dark:bg-indigo-950/20 p-3 space-y-2">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-medium">Claude subscription</p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      Sign in with a Claude Pro/Max plan instead of an API key.
+                    </p>
+                  </div>
+                  {claudeConnected ? (
+                    <span className="inline-flex items-center gap-1 rounded-full border border-green-500/40 bg-green-50 dark:bg-green-950/30 px-2.5 py-1 text-xs font-medium text-green-700 dark:text-green-300">
+                      <span aria-hidden="true">✓</span> signed in
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={handleOAuthStart}
+                      className="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700"
+                    >
+                      Sign in with Claude
+                    </button>
+                  )}
+                </div>
+
+                {claudeConnected && (
+                  <div className="flex flex-wrap items-center gap-3 text-xs text-gray-600 dark:text-gray-300">
+                    <span>
+                      {settings?.claude_oauth_account || 'Claude subscription'}
+                      {settings?.claude_oauth_expires_at
+                        ? ` · token refreshes automatically (access expires ${formatExpiry(settings.claude_oauth_expires_at)})`
+                        : ' · token refreshes automatically'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleOAuthDisconnect}
+                      className="font-medium text-red-500 hover:underline"
+                    >
+                      Disconnect
+                    </button>
+                  </div>
+                )}
+
+                {oauthFlow && (
+                  <div className="space-y-2">
+                    <p className="text-xs text-gray-600 dark:text-gray-300">
+                      Approve access in the new tab, copy the code Claude shows, and paste it here.
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        value={oauthCode}
+                        onChange={(e) => setOauthCode(e.target.value)}
+                        placeholder="Paste the code (code#state)"
+                        autoComplete="off"
+                        className="min-w-[12rem] flex-1 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleOAuthExchange}
+                        disabled={oauthBusy || !oauthCode.trim()}
+                        className="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+                      >
+                        {oauthBusy ? 'Connecting…' : 'Connect'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setOauthFlow(null); setOauthCode('') }}
+                        className="rounded-md border border-gray-300 dark:border-gray-600 px-3 py-2 text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {oauthError && <p className="text-xs text-red-500">{oauthError}</p>}
+                {oauthNotice && (
+                  <p className={`text-xs ${oauthNotice.type === 'error' ? 'text-red-500' : 'text-green-600 dark:text-green-400'}`}>
+                    {oauthNotice.text}
+                  </p>
+                )}
+              </div>
+            )}
+
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-12 gap-3 items-end">
               <div className="lg:col-span-2">
                 <label htmlFor="provider" className="block text-xs tracking-wide text-gray-500 dark:text-gray-400 mb-1 uppercase">
@@ -346,7 +500,7 @@ export default function SettingsPage() {
                   autoComplete="off"
                   value={form.api_key}
                   onChange={(e) => setForm((f) => ({ ...f, api_key: e.target.value }))}
-                  placeholder={hasStoredKey(settings, spec) ? 'Saved key' : spec.keyPlaceholder}
+                  placeholder={settings?.[spec.keyField] ? 'Saved key' : spec.keyPlaceholder}
                   className="w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
                 />
               </div>
@@ -401,7 +555,7 @@ export default function SettingsPage() {
                   ? <span className="text-red-500">{modelError}</span>
                   : models.length
                     ? `${models.length} models available — pick a default above.`
-                    : hasStoredKey(settings, spec)
+                    : isProviderConfigured(settings, spec)
                       ? 'Using the saved key. Leave the key blank to keep it.'
                       : 'Paste a key to load the model list.'}
             </p>
@@ -449,4 +603,11 @@ export default function SettingsPage() {
 
 function providerLabel(value) {
   return PROVIDER_MAP[value]?.label || value
+}
+
+function formatExpiry(value) {
+  if (!value) return ''
+  const date = new Date(value.endsWith('Z') ? value : `${value}Z`)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString()
 }

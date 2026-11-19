@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import {
   exportCoverLetter, finalizeReview, generateCoverLetter, getReview,
-  refreshRequirements, rescoreReview, resetSuggestionText, saveCoverLetter,
+  rescoreReview, resetSuggestionText, saveCoverLetter,
   setSuggestionStatus, streamReviewEvents, updateSuggestionText,
 } from '../api'
 import ScoreGauge from '../components/ScoreGauge'
@@ -25,7 +25,6 @@ export default function ReviewPage() {
   const [error, setError] = useState(null)
   const [deciding, setDeciding] = useState(false)
   const [rescoring, setRescoring] = useState(false)
-  const [refreshingKeywords, setRefreshingKeywords] = useState(false)
   const [showJd, setShowJd] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
   const [exporting, setExporting] = useState(false)
@@ -145,18 +144,6 @@ export default function ReviewPage() {
       setError(e.message)
     } finally {
       setRescoring(false)
-    }
-  }
-
-  async function handleRefreshKeywords() {
-    setRefreshingKeywords(true)
-    setError(null)
-    try {
-      setReview(await refreshRequirements(id))
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setRefreshingKeywords(false)
     }
   }
 
@@ -316,8 +303,6 @@ export default function ReviewPage() {
             requirements={review.requirements || []}
             matched={review.matched_keywords || []}
             missing={review.missing_keywords || []}
-            onRefresh={handleRefreshKeywords}
-            refreshing={refreshingKeywords}
           />
         </div>
       </div>
@@ -358,7 +343,6 @@ export default function ReviewPage() {
         onGenerate={handleGenerateLetter}
         onSave={handleSaveLetter}
         onExport={handleExportLetter}
-        finalized={review.status === 'finalized'}
         busy={letterBusy}
         saved={letterSaved}
       />

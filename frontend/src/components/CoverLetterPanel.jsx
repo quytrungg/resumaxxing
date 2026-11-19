@@ -1,7 +1,20 @@
+import { useState } from 'react'
+
+const DOWNLOAD_OPTIONS = [
+  { format: 'docx', label: 'Word (.docx)' },
+  { format: 'pdf', label: 'PDF' },
+]
+
 export default function CoverLetterPanel({
-  letter, onChange, onGenerate, onSave, onExport, finalized, busy, saved,
+  letter, onChange, onGenerate, onSave, onExport, busy, saved,
 }) {
   const hasLetter = Boolean(letter && letter.trim())
+  const [downloadOpen, setDownloadOpen] = useState(false)
+
+  function handleExport(format) {
+    setDownloadOpen(false)
+    onExport(format)
+  }
 
   return (
     <section className="bg-white dark:bg-gray-800 border dark:border-gray-700 rounded-lg p-5 mt-8">
@@ -9,15 +22,14 @@ export default function CoverLetterPanel({
         <div>
           <h2 className="font-semibold">Cover letter</h2>
           <p className="text-xs text-gray-500 dark:text-gray-400">
-            {finalized
-              ? 'Generated from your tailored CV and this job description.'
-              : 'Finalize the CV first to unlock cover letter generation.'}
+            Built from your CV with accepted suggestions and this job
+            description. Regenerate after changing suggestions.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
           <button
             onClick={onGenerate}
-            disabled={!finalized || busy}
+            disabled={busy}
             className="px-3 py-1.5 text-xs font-medium bg-indigo-600 text-white rounded-md hover:bg-indigo-700 disabled:opacity-50"
           >
             {busy ? 'Working…' : hasLetter ? 'Regenerate' : 'Generate'}
@@ -29,16 +41,28 @@ export default function CoverLetterPanel({
           >
             Save
           </button>
-          {['docx', 'pdf'].map((fmt) => (
+          <div className="relative">
             <button
-              key={fmt}
-              onClick={() => onExport(fmt)}
+              onClick={() => setDownloadOpen((v) => !v)}
               disabled={!hasLetter || busy}
               className="px-3 py-1.5 text-xs font-medium border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50"
             >
-              {fmt === 'docx' ? 'Download Word' : 'Download PDF'}
+              Download ▾
             </button>
-          ))}
+            {downloadOpen && (
+              <div className="absolute right-0 mt-1 w-40 bg-white dark:bg-gray-800 border dark:border-gray-600 rounded-md shadow-lg z-10 overflow-hidden">
+                {DOWNLOAD_OPTIONS.map(({ format, label }) => (
+                  <button
+                    key={format}
+                    onClick={() => handleExport(format)}
+                    className="w-full text-left px-4 py-2 text-sm hover:bg-indigo-50 dark:hover:bg-gray-700"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </div>
       {hasLetter ? (

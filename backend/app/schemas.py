@@ -28,6 +28,11 @@ class SettingsOut(BaseModel):
 
     llm_provider: str = "mock"
     claude_key: Optional[str] = None
+    # Claude subscription session state (tokens never leave the backend).
+    claude_auth_mode: str = "api_key"
+    claude_oauth_connected: bool = False
+    claude_oauth_account: Optional[str] = None
+    claude_oauth_expires_at: Optional[datetime] = None
     ollama_key: Optional[str] = None
     opencode_key: Optional[str] = None
     opencode_go_key: Optional[str] = None
@@ -46,6 +51,14 @@ class ModelListIn(BaseModel):
     provider: str
     api_key: Optional[str] = None
     base_url: Optional[str] = None
+
+
+class ClaudeOAuthExchangeIn(BaseModel):
+    """Code returned by the Claude.ai manual-redirect page."""
+
+    code: str = Field(min_length=1, max_length=4000)
+    state: str = Field(min_length=1, max_length=500)
+    code_verifier: str = Field(min_length=16, max_length=200)
 
 
 class BaseCVOut(BaseModel):

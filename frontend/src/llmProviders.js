@@ -39,7 +39,7 @@ export const PROVIDERS = [
     baseUrlField: 'opencode_go_base_url',
     modelField: 'opencode_go_model',
     defaultBaseUrl: 'https://opencode.ai/zen/go',
-    defaultModel: 'glm-5.3',
+    defaultModel: 'deepseek-v4.1-flash',
     keyPlaceholder: 'Opencode Go API key',
     basePlaceholder: 'https://opencode.ai/zen/go',
   },
@@ -51,6 +51,16 @@ export const PROVIDER_MAP = Object.fromEntries(
 
 export function providerLabel(value) {
   return PROVIDER_MAP[value]?.label || value
+}
+
+/**
+ * A provider is usable when it has a saved API key, or when Claude has an
+ * active subscription (OAuth) session.
+ */
+export function isProviderConfigured(settings, spec) {
+  if (!settings || !spec) return false
+  if (spec.keyField && settings[spec.keyField]) return true
+  return spec.value === 'claude' && Boolean(settings.claude_oauth_connected)
 }
 
 const CATALOG_KEY = 'modelCatalog'

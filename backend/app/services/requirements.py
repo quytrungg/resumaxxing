@@ -184,8 +184,12 @@ def _first_occurrence(text: str, term: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
-def _quote_for(text: str, term: str) -> Optional[str]:
-    """The JD line containing `term`, trimmed - evidence for the panel."""
+def quote_for(text: str, term: str) -> Optional[str]:
+    """The JD line containing `term`, trimmed - evidence for the panel.
+
+    The model is no longer asked for the quote (it was the most expensive part
+    of its payload); the caller derives it locally instead.
+    """
     pattern = _compiled(term, re.IGNORECASE)
     for line in text.splitlines():
         if pattern.search(line):
@@ -282,6 +286,6 @@ def from_heuristic(jd_text: str, top_n: int = 30) -> List[Requirement]:
             canonical=canonical,
             aliases=list(ALIASES.get(canonical, [])),
             importance=MUST,
-            quote=_quote_for(jd_text, keyword),
+            quote=quote_for(jd_text, keyword),
         ))
     return requirements
